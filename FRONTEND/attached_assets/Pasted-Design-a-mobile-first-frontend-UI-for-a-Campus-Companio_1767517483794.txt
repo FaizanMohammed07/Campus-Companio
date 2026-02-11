@@ -1,0 +1,107 @@
+Design a mobile-first frontend UI for a Campus Companion & Delivery Robot.
+Context
+The UI runs on a mobile phone mounted on the robot.
+The phone acts as:
+Main touch screen
+Camera input for computer vision (YOLO / navigation).
+The robot helps visitors and faculty inside a college campus.
+Visual Personality
+Friendly, calm, cute robot personality (soft, approachable).
+Inspired by a modern service robot with a digital face.
+Rounded UI elements, minimalistic, clean design.
+Light theme with subtle blue accent lights.
+The robot should feel helpful, safe, and intelligent.
+📱 SCREEN 1 — Home / Welcome Screen
+Create a full-screen welcome UI with:
+Robot face animation or emoji-like eyes at the top
+Greeting text:
+“Hello! 👋 I’m your Campus Guide”
+Subtitle:
+“How can I help you today?”
+Main Buttons (Large, Touch-Friendly)
+🎓 Visitor Help
+📦 Faculty / Office Use
+ℹ️ Campus Info
+Buttons should be:
+Big
+Rounded
+High contrast
+Easy for elderly parents & visitors
+📱 SCREEN 2 — Visitor Help Flow
+When Visitor Help is selected:
+Show options as cards or buttons:
+💰 Fee Payment
+📝 Admissions
+🏢 Administration Office
+📚 Library
+🧑‍💼 Exam Cell
+🍽 Canteen
+📍 Other Locations
+On selection:
+Display message:
+“The Fee Payment section is in A Block.”
+Ask a confirmation:
+“Would you like me to guide you there?”
+Buttons:
+✅ Yes, guide me
+❌ No, just directions
+If Yes:
+Show navigation status screen:
+“Please follow me 🚶‍♂️”
+Animated progress indicator
+Destination name
+Disable further inputs while moving
+If No:
+Show text directions clearly
+Button: Back to Home
+📱 SCREEN 3 — Faculty / Office Mode
+When Faculty / Office Use is selected:
+Require simple verification (optional):
+PIN / OTP input UI (simple, clean)
+Then show:
+📥 Call Robot to My Location
+📤 Send Items to Another Block
+Pickup selection:
+Dropdown or buttons:
+A Block
+B Block
+Admin Block
+Library
+Exam Cell
+Delivery selection:
+Same block options
+Action button:
+🚀 Start Task
+Status screen:
+“Robot is on the way”
+“Please place items on the tray when arrived”
+“Delivery in progress”
+📷 CAMERA ACCESS REQUIREMENTS (VERY IMPORTANT)
+Use phone camera access (navigator.mediaDevices.getUserMedia).
+Camera should:
+Run in background for robot vision.
+Not block UI interaction.
+Show small camera preview window (optional, bottom corner).
+Camera permissions must be requested gracefully on first load.
+Allow switching between:
+Front camera (default)
+Rear camera (optional toggle for admin/debug)
+🗣 VOICE & FEEDBACK UI
+On-screen captions for what robot is speaking.
+Visual feedback when robot is listening or processing.
+Status colors:
+Blue → Ready
+Green → Moving
+Yellow → Waiting / Obstacle
+Red → Emergency Stop
+🛑 SAFETY & ACCESSIBILITY
+Emergency Stop button always visible (floating button).
+Large fonts, high contrast.
+Touch-friendly spacing.
+Works fully in portrait mode.
+🧩 TECH REQUIREMENTS
+Mobile-first responsive design
+HTML, CSS, JavaScript (or React if needed)
+Clean component structure
+Camera access using Web APIs
+Easy to connect with backend via REST / WebSocket
