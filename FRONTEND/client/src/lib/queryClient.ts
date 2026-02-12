@@ -23,7 +23,11 @@ export async function apiRequest(
   url: string,
   data?: unknown | undefined,
 ): Promise<Response> {
-  const res = await fetch(url, {
+  const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || "";
+  // Ensure we don't double-slash or mis-format the URL if it's already absolute
+  const targetUrl = url.startsWith("http") ? url : `${apiBaseUrl}${url}`;
+
+  const res = await fetch(targetUrl, {
     method,
     headers: data ? { "Content-Type": "application/json" } : {},
     body: data ? JSON.stringify(data) : undefined,

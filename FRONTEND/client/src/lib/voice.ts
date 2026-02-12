@@ -1,3 +1,5 @@
+import { apiRequest } from "./queryClient";
+
 export type UiContext = {
   current_page: string;
   available_actions: string[];
@@ -15,16 +17,11 @@ export async function sendVoiceCommand(
   transcript: string,
   uiContext: UiContext,
 ): Promise<VoiceApiResponse> {
-  const res = await fetch("/api/voice-command", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify({ transcript, uiContext }),
+  const res = await apiRequest("POST", "/api/voice-command", {
+    transcript,
+    uiContext,
   });
-  if (!res.ok) {
-    const message = await readErrorMessage(res);
-    throw new Error(`Voice API ${res.status}: ${message}`);
-  }
+
   const payload = await res.json();
   return unwrapApiResponse<VoiceApiResponse>(payload);
 }
