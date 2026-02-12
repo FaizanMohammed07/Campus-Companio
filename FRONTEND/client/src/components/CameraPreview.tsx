@@ -1,4 +1,3 @@
-
 import { motion } from "framer-motion";
 import { Camera } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
@@ -44,11 +43,6 @@ export function CameraPreview() {
           muted
           className="w-full h-full object-cover"
         />
-      ) : error ? (
-        <div className="flex flex-col items-center text-red-500 text-xs">
-          <Camera className="w-6 h-6 mb-1 opacity-50" />
-          <span>{error}</span>
-        </div>
       ) : (
         <div className="flex flex-col items-center text-slate-500">
           <Camera className="w-6 h-6 mb-1 opacity-50" />
