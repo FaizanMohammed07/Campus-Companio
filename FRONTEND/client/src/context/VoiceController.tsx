@@ -61,6 +61,47 @@ export function useVoiceController() {
   return ctx;
 }
 
+// ============= LOCATION EXTRACTION =============
+function extractLocation(transcript: string): string | null {
+  const lower = transcript.toLowerCase().trim();
+
+  // Location mappings
+  const locations: Record<string, string> = {
+    "a block": "A_BLOCK",
+    "block a": "A_BLOCK",
+    "a-block": "A_BLOCK",
+    "b block": "B_BLOCK",
+    "block b": "B_BLOCK",
+    "b-block": "B_BLOCK",
+    admin: "ADMIN",
+    "admin block": "ADMIN",
+    administration: "ADMIN",
+    admission: "ADMISSION",
+    admissions: "ADMISSION",
+    "admission office": "ADMISSION",
+    "admissions office": "ADMISSION",
+    fee: "FEE",
+    "fee counter": "FEE",
+    "fee payment": "FEE",
+    fees: "FEE",
+    library: "LIBRARY",
+    lib: "LIBRARY",
+    canteen: "CANTEEN",
+    cafe: "CANTEEN",
+    cafeteria: "CANTEEN",
+    "food court": "CANTEEN",
+  };
+
+  // Check exact matches first
+  for (const [key, value] of Object.entries(locations)) {
+    if (lower.includes(key)) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
 // ============= INTENT DETECTION WITH CONFIDENCE =============
 function detectIntent(transcript: string): {
   intent: Intent;
@@ -290,6 +331,68 @@ export function VoiceControllerProvider({
       setCurrentIntent(intent);
       setDisplayTranscript(transcript);
 
+      // Check if user mentioned a location
+      const mentionedLocation = extractLocation(transcript);
+
+      // If location mentioned with guide/navigation intent, auto-navigate
+      if (
+        mentionedLocation &&
+        (intent === "guide" ||
+          (intent === "navigation" &&
+            /\b(guide|take|show)\b/i.test(transcript)))
+      ) {
+        console.log(
+          `[Voice] Location '${mentionedLocation}' mentioned with guide intent - auto-navigating to guidance`,
+        );
+        setDestination(mentionedLocation);
+        setDirections(DIRECTIONS_DB[mentionedLocation] || []);
+        setNavigationMode("guiding");
+        setConversationState("navigating");
+        setIsListening(false);
+        stopSpeechRecognition();
+
+        const label = mentionedLocation.replace(/_/g, " ");
+        const dirs = DIRECTIONS_DB[mentionedLocation] || [];
+        await speakAndResume(
+          `${label}. I will guide you there. Please follow me.`,
+          false,
+        );
+        setTimeout(() => {
+          setLocation(`/guidance/${mentionedLocation}`);
+        }, 1500);
+        setTranscript("");
+        isProcessingRef.current = false;
+        return;
+      }
+
+      // If location mentioned with directions intent, show directions page
+      if (
+        mentionedLocation &&
+        intent === "navigation" &&
+        !/\b(guide|take|show)\b/i.test(transcript)
+      ) {
+        console.log(
+          `[Voice] Location '${mentionedLocation}' mentioned with directions intent - navigating to directions`,
+        );
+        setDestination(mentionedLocation);
+        setDirections(DIRECTIONS_DB[mentionedLocation] || []);
+        setNavigationMode("directions");
+
+        const label = mentionedLocation.replace(/_/g, " ");
+        const dirs = DIRECTIONS_DB[mentionedLocation] || [];
+        const dirText = dirs.join(" Then ");
+        await speakAndResume(
+          `${label} is located on campus. ${dirText}`,
+          false,
+        );
+        setTimeout(() => {
+          setLocation(`/directions/${mentionedLocation}`);
+        }, 2000);
+        setTranscript("");
+        isProcessingRef.current = false;
+        return;
+      }
+
       // Route based on intent
       if (intent === "greeting" && confidence > 0.9) {
         // Store greeting and start 3-second wait
@@ -396,14 +499,8 @@ export function VoiceControllerProvider({
   const handleNavigation = useCallback(
     async (transcript: string) => {
       // Extract destination from speech
-      let dest = "A_BLOCK"; // Default
-
-      if (/\b(a\s*block)\b/i.test(transcript)) dest = "A_BLOCK";
-      else if (/\b(b\s*block)\b/i.test(transcript)) dest = "B_BLOCK";
-      else if (/\b(admin|admission)\b/i.test(transcript)) dest = "ADMISSION";
-      else if (/\b(fee|payment)\b/i.test(transcript)) dest = "FEE";
-      else if (/\b(library)\b/i.test(transcript)) dest = "LIBRARY";
-      else if (/\b(canteen|cafe)\b/i.test(transcript)) dest = "CANTEEN";
+      const extractedLocation = extractLocation(transcript);
+      const dest = extractedLocation || "A_BLOCK";
 
       setDestination(dest);
       setDirections(DIRECTIONS_DB[dest] || []);
@@ -441,8 +538,19 @@ export function VoiceControllerProvider({
         "Please follow me. I will guide you safely to your destination.",
         false,
       );
+
+      // Auto-navigate to guidance page
+      setTimeout(() => {
+        setLocation(`/guidance/${activeDestination}`);
+      }, 1500);
     },
-    [destination, isListening, stopSpeechRecognition, speakAndResume],
+    [
+      destination,
+      isListening,
+      stopSpeechRecognition,
+      speakAndResume,
+      setLocation,
+    ],
   );
 
   const handleStop = useCallback(async () => {
