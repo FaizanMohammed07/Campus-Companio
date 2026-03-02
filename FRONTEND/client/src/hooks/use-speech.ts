@@ -7,11 +7,18 @@ export function useSpeechRecognition() {
   const [state, setState] = useState<SpeechState>("idle");
   const [transcript, setTranscript] = useState("");
   const [listening, setListening] = useState(false);
+  const [permissionGranted, setPermissionGranted] = useState<boolean | null>(
+    null,
+  );
   const recognitionRef = useRef<any>(null);
   const finalBufferRef = useRef<string>("");
   const finalFlushTimerRef = useRef<number | null>(null);
+  const shouldListenRef = useRef(false);
+  const restartTimerRef = useRef<number | null>(null);
+  const isMountedRef = useRef(true);
 
   useEffect(() => {
+    isMountedRef.current = true;
     const SpeechRecognition =
       (window as any).SpeechRecognition ||
       (window as any).webkitSpeechRecognition;
@@ -23,19 +30,57 @@ export function useSpeechRecognition() {
     recognition.interimResults = true;
     recognition.lang = navigator.language || "en-US";
 
-    recognition.onstart = () => setState("listening");
+    recognition.onstart = () => {
+      if (!isMountedRef.current) return;
+      setState("listening");
+      setListening(true);
+    };
     recognition.onend = () => {
+      if (!isMountedRef.current) return;
       setState("idle");
-      if (listening) {
-        // Auto-restart for always-listening mode
-        try {
-          recognition.start();
-        } catch {
-          // ignore "already started" and similar browser quirks
+
+      // Auto-restart if mic should remain on
+      if (shouldListenRef.current) {
+        if (restartTimerRef.current) {
+          window.clearTimeout(restartTimerRef.current);
         }
+        restartTimerRef.current = window.setTimeout(() => {
+          try {
+            recognition.start();
+          } catch {
+            // ignore browser quirks; next onend cycle can retry
+          }
+        }, 200);
       }
     };
-    recognition.onerror = () => setState("idle");
+    recognition.onerror = (event: any) => {
+      if (!isMountedRef.current) return;
+      setState("idle");
+
+      // Fatal cases: do not keep looping
+      if (
+        event?.error === "not-allowed" ||
+        event?.error === "service-not-allowed"
+      ) {
+        shouldListenRef.current = false;
+        setListening(false);
+        return;
+      }
+
+      // Recoverable errors: retry if mic should stay on
+      if (shouldListenRef.current) {
+        if (restartTimerRef.current) {
+          window.clearTimeout(restartTimerRef.current);
+        }
+        restartTimerRef.current = window.setTimeout(() => {
+          try {
+            recognition.start();
+          } catch {
+            // ignore
+          }
+        }, 300);
+      }
+    };
 
     recognition.onresult = (event: any) => {
       let finalText = "";
@@ -56,6 +101,8 @@ export function useSpeechRecognition() {
       const trimmedFinal = finalText.trim();
       if (!trimmedFinal) return;
 
+      console.log(`[SpeechRec] Final transcript: "${trimmedFinal}"`);
+
       // Buffer final chunks so fast/continuous speech doesn't trigger multiple requests.
       finalBufferRef.current =
         `${finalBufferRef.current} ${trimmedFinal}`.trim();
@@ -67,34 +114,34 @@ export function useSpeechRecognition() {
         finalBufferRef.current = "";
         finalFlushTimerRef.current = null;
         if (!buffered) return;
+        console.log(`[SpeechRec] Setting transcript to: "${buffered}"`);
         setTranscript(buffered);
         setState("processing");
       }, 450);
     };
 
-    if (listening) {
-      try {
-        recognition.start();
-      } catch {
-        // already started
-      }
-    }
-
     return () => {
+      isMountedRef.current = false;
       if (finalFlushTimerRef.current) {
         window.clearTimeout(finalFlushTimerRef.current);
         finalFlushTimerRef.current = null;
+      }
+      if (restartTimerRef.current) {
+        window.clearTimeout(restartTimerRef.current);
+        restartTimerRef.current = null;
       }
       try {
         recognition.stop();
       } catch {}
     };
-  }, [listening]);
+  }, []);
 
   const requestPermission = async () => {
     try {
       await navigator.mediaDevices.getUserMedia({ audio: true });
+      setPermissionGranted(true);
     } catch (e) {
+      setPermissionGranted(false);
       console.error("Microphone permission denied", e);
     }
   };
@@ -102,6 +149,7 @@ export function useSpeechRecognition() {
   const start = () => {
     const recognition = recognitionRef.current;
     if (!recognition) return;
+    shouldListenRef.current = true;
     setListening(true);
     try {
       recognition.start();
@@ -113,7 +161,12 @@ export function useSpeechRecognition() {
   const stop = () => {
     const recognition = recognitionRef.current;
     if (!recognition) return;
+    shouldListenRef.current = false;
     setListening(false);
+    if (restartTimerRef.current) {
+      window.clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
     try {
       recognition.stop();
     } catch {}
@@ -129,6 +182,7 @@ export function useSpeechRecognition() {
     requestPermission,
     listening,
     setListening,
+    permissionGranted,
   };
 }
 

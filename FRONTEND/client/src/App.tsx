@@ -6,11 +6,12 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/not-found";
 import Home from "@/pages/Home";
 import VisitorHelp from "@/pages/VisitorHelp";
+import DirectionsPage from "@/pages/DirectionsPage";
+import GuidancePage from "@/pages/GuidancePage";
 import FacultyAccess from "@/pages/FacultyAccess";
 import Perception from "@/pages/Perception";
 import { StatusBar } from "@/components/StatusBar";
 import { EmergencyStop } from "@/components/EmergencyStop";
-import { CameraPreview } from "@/components/CameraPreview";
 import { useEffect } from "react";
 import { VoiceControllerProvider } from "@/context/VoiceController";
 import { MicrophoneControl } from "@/components/MicrophoneControl";
@@ -21,6 +22,8 @@ function Router() {
     <Switch>
       <Route path="/" component={Home} />
       <Route path="/visitor" component={VisitorHelp} />
+      <Route path="/directions/:id" component={DirectionsPage} />
+      <Route path="/guidance/:id" component={GuidancePage} />
       <Route path="/faculty" component={FacultyAccess} />
       <Route path="/perception" component={Perception} />
       <Route component={NotFound} />
@@ -54,7 +57,6 @@ function App() {
             </div>
 
             <EmergencyStop />
-            <CameraPreview />
             <MicrophoneControl />
             <VoiceTest />
 
