@@ -2,18 +2,21 @@
 app.py — Flask server + VisionPipeline orchestration.
 
 This is the SINGLE AUTHORITY for movement commands.
-ESP32 polls POST /robot-command every 150ms.
+Commands are sent to ESP32 over USB Serial (COM port).
+ESP32 polls POST /robot-command is kept as fallback.
 Backend sets destination via POST /set-destination.
 Backend stops via POST /stop.
 
 Architecture:
   camera → person YOLO → nav YOLO → fusion → command
+  command → Serial USB → ESP32
   Person avoidance ALWAYS overrides navigation commands.
   If no mission is active, the pipeline returns STOP.
 """
 
 import base64
 import logging
+import os
 import threading
 import time
 
@@ -58,6 +61,15 @@ class VisionPipeline:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
+        # ── SCAN (360° turn) state ──
+        self._blocked_count: int = 0       # consecutive frames with frame_blocked
+        self._last_scan_ts: float = 0.0    # timestamp of last SCAN command
+
+        # ── Serial USB sender to ESP32 ──
+        self._serial_port = None
+        self._serial_thread: threading.Thread | None = None
+        self._last_serial_cmd: str = "STOP"
+
     # ── Lifecycle ──
 
     def start(self) -> None:
@@ -67,6 +79,9 @@ class VisionPipeline:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+        # Start serial sender thread
+        self._serial_thread = threading.Thread(target=self._serial_loop, daemon=True)
+        self._serial_thread.start()
         log.info("VisionPipeline started")
 
     def shutdown(self) -> None:
@@ -75,9 +90,59 @@ class VisionPipeline:
         self._camera.stop()
         if self._thread:
             self._thread.join(timeout=5.0)
+        if self._serial_port:
+            try:
+                self._serial_port.write(b"STOP\n")
+                self._serial_port.close()
+            except Exception:
+                pass
         with self._lock:
             self._running = False
         log.info("VisionPipeline shutdown complete")
+
+    # ── Serial USB sender loop ──
+
+    def _serial_loop(self) -> None:
+        """Background thread: push latest command to ESP32 over USB Serial."""
+        import serial  # pyserial
+
+        port = settings.serial_port
+        baud = settings.serial_baud
+
+        log.info("[SERIAL] Connecting to %s @ %d baud...", port, baud)
+
+        while not self._stop_event.is_set():
+            # Try to open / reopen the serial port
+            if self._serial_port is None or not self._serial_port.is_open:
+                try:
+                    self._serial_port = serial.Serial(port, baud, timeout=0.1)
+                    log.info("[SERIAL] Connected to %s", port)
+                except Exception as e:
+                    log.warning("[SERIAL] Cannot open %s: %s — retrying in 2s", port, e)
+                    time.sleep(2.0)
+                    continue
+
+            # Get latest command
+            cmd = self.get_command()
+
+            # Only send if command changed (reduce serial traffic)
+            # But always send periodically to keep watchdog alive
+            try:
+                self._serial_port.write(f"{cmd}\n".encode())
+                self._serial_port.flush()
+                if cmd != self._last_serial_cmd:
+                    log.info("[SERIAL] Sent: %s", cmd)
+                    self._last_serial_cmd = cmd
+            except Exception as e:
+                log.warning("[SERIAL] Write failed: %s — reconnecting", e)
+                try:
+                    self._serial_port.close()
+                except Exception:
+                    pass
+                self._serial_port = None
+
+            # ~100ms interval (≈10 Hz command rate)
+            time.sleep(0.1)
 
     # ── Navigator delegation ──
 
@@ -189,6 +254,9 @@ class VisionPipeline:
                 "person_ratio": round(perception.person_ratio, 4),
                 "person_zone": perception.person_zone,
                 "person_distance_tier": person_distance_tier,
+                "person_count": perception.person_count,
+                "total_person_coverage": round(perception.total_person_coverage, 4),
+                "frame_blocked": perception.frame_blocked,
                 "confidence": round(perception.confidence, 3),
                 "person_detections": person_detections,
                 # Nav model
@@ -217,6 +285,7 @@ class VisionPipeline:
                 Intent.LEFT: (255, 200, 0),
                 Intent.RIGHT: (255, 200, 0),
                 Intent.BACK: (128, 0, 128),
+                Intent.SCAN: (255, 0, 255),
             }.get(intent, (0, 0, 255))
 
             # Draw person boxes
@@ -320,6 +389,38 @@ class VisionPipeline:
                 nav_result = NavPerceptionResult()
 
             # ══════════════════════════════════════════════════════════
+            #  PRIORITY 0: SCAN — Frame blocked by too many persons
+            #
+            #  When the whole frame is filled with people (multiple
+            #  persons covering >40% of frame), normal left/right
+            #  steering can't help.  After sustained blocking, issue
+            #  a SCAN command: ESP32 does a full 360° spin-in-place
+            #  while Python keeps analyzing frames to find a clear
+            #  path.  Once a clear frame appears, normal logic resumes.
+            # ══════════════════════════════════════════════════════════
+            if perception.frame_blocked:
+                self._blocked_count += 1
+            else:
+                self._blocked_count = 0
+
+            scan_on_cooldown = (
+                time.time() - self._last_scan_ts < settings.scan_cooldown_s
+            )
+
+            if (
+                self._blocked_count >= settings.scan_trigger_frames
+                and not scan_on_cooldown
+            ):
+                intent = Intent.SCAN
+                self._blocked_count = 0
+                self._last_scan_ts = time.time()
+                log.info(
+                    "[FUSION] SCAN triggered — %d persons, coverage=%.1f%%",
+                    perception.person_count,
+                    perception.total_person_coverage * 100,
+                )
+
+            # ══════════════════════════════════════════════════════════
             #  FUSION: Distance-tiered person avoidance + navigation
             #
             #  FAR person  (ratio < 0.08)  → navigator drives (ignore person)
@@ -329,7 +430,7 @@ class VisionPipeline:
             #  No person                   → navigator drives
             #  Navigator IDLE (no mission) → STOP
             # ══════════════════════════════════════════════════════════
-            if not perception.person_detected:
+            elif not perception.person_detected:
                 # No person → navigator controls
                 nav_cmd = self._navigator.update(nav_result)
                 try:
@@ -424,6 +525,7 @@ class VisionPipeline:
                 Intent.LEFT: (255, 200, 0),
                 Intent.RIGHT: (255, 200, 0),
                 Intent.BACK: (128, 0, 128),
+                Intent.SCAN: (255, 0, 255),
             }.get(intent, (0, 0, 255))
 
             display = frame.copy()

@@ -27,6 +27,9 @@ class PerceptionResult:
     person_zone: str = "NONE"   # LEFT | CENTER | RIGHT | NONE
     confidence: float = 0.0
     boxes: list = field(default_factory=list)  # [(x1,y1,x2,y2,conf), ...]
+    person_count: int = 0               # total persons detected
+    total_person_coverage: float = 0.0  # sum of all person bbox areas / frame area
+    frame_blocked: bool = False         # True when persons fill most of frame
 
 
 class PersonDetector:
@@ -82,10 +85,26 @@ class PersonDetector:
         else:
             zone = "CENTER"
 
+        # Total coverage = sum of all person bbox areas / frame area
+        total_coverage = sum(
+            (b[2] - b[0]) * (b[3] - b[1]) / frame_area for b in person_boxes
+        )
+        n_persons = len(person_boxes)
+        # Frame is "blocked" when multiple persons cover >40% of frame
+        # or a single person covers >50% (basically can't go anywhere)
+        blocked = (
+            (n_persons >= 2 and total_coverage >= settings.frame_blocked_ratio)
+            or (n_persons >= 3 and total_coverage >= 0.30)
+            or total_coverage >= 0.50
+        )
+
         return PerceptionResult(
             person_detected=True,
             person_ratio=best_ratio,
             person_zone=zone,
             confidence=best_conf,
             boxes=person_boxes,
+            person_count=n_persons,
+            total_person_coverage=total_coverage,
+            frame_blocked=blocked,
         )

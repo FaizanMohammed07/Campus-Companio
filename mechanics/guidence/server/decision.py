@@ -39,6 +39,7 @@ class Intent(str, Enum):
     LEFT = "LEFT"
     RIGHT = "RIGHT"
     BACK = "BACK"
+    SCAN = "SCAN"  # 360° spin-in-place to find clear path
 
 
 class DecisionEngine:

@@ -23,6 +23,14 @@ class Settings:
     host: str = "0.0.0.0"
     port: int = int(os.getenv("VISION_PORT", "8000"))
 
+    # ── Serial USB to ESP32 ──
+    #    Set SERIAL_PORT env var to your COM port.
+    #    macOS: /dev/tty.usbserial-0001  or  /dev/cu.usbserial-0001
+    #    Windows: COM9
+    #    Linux: /dev/ttyUSB0
+    serial_port: str = os.getenv("SERIAL_PORT", "/dev/tty.usbserial-0001")
+    serial_baud: int = int(os.getenv("SERIAL_BAUD", "115200"))
+
     # ── Pipeline health ──
     max_frame_age_s: float = 1.0
     max_inference_failures: int = 3
@@ -33,6 +41,16 @@ class Settings:
     #    NEAR:   ratio ≥ 0.25 → very close → STOP
     person_far_ratio: float = 0.08
     person_near_ratio: float = 0.25
+
+    # ── Frame blocked threshold ──
+    #    When total person coverage (sum of all person bboxes / frame area)
+    #    exceeds this AND there are 2+ persons → frame is "blocked"
+    #    Triggers a 360° SCAN to find a clear path
+    frame_blocked_ratio: float = 0.40
+    # Consecutive "blocked" frames before triggering SCAN (debounce)
+    scan_trigger_frames: int = 5
+    # Cooldown: min seconds between consecutive SCAN commands
+    scan_cooldown_s: float = 8.0
 
     # ── Frame horizontal zones (normalized 0.0 – 1.0) ──
     zone_left_max: float = 0.35

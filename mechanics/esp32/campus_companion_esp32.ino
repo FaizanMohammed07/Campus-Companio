@@ -1,11 +1,13 @@
 // ============================================================
 //  Guido — Campus Companion Robot — ESP32 Motor Controller
-//  Production Firmware v2.0
+//  Serial USB Version (COM9 @ 115200 baud)
 //
 //  ARCHITECTURE:
-//    ESP32 polls Python Vision Server POST /robot-command
-//    every 150 ms.  Python is the SINGLE AUTHORITY for
-//    movement commands.  ESP32 only adds safety overrides.
+//    Laptop Python Vision Server sends commands over USB Serial.
+//    Commands: CRUISE, STOP, LEFT, RIGHT, BACK, SCAN,
+//              PREFER_LEFT, PREFER_RIGHT
+//    ESP32 reads Serial, applies ultrasonic safety overrides,
+//    then executes the motor command.
 //
 //  SAFETY LAYERS (highest priority first):
 //    L1  HARD STOP      — FRONT < 20 cm → immediate full stop
@@ -14,32 +16,13 @@
 //                        — RIGHT < 15 → turn left
 //    L4  SOFT SLOWDOWN   — FRONT 20–50 cm → reduce PWM to 60%
 //    L5  WATCHDOG        — No valid cmd for >1000 ms → STOP
-//    L6  EXECUTE         — Vision server command
-//
-//  Ultrasonic reads use pulseIn() with 20 ms timeout
-//  (non-blocking enough at 150 ms poll rate).
+//    L6  EXECUTE         — Serial command
 // ============================================================
 
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
 #include <ESP32Servo.h>
 
-// ======================== WIFI ========================
-const char* WIFI_SSID     = "TANMAY2.0";
-const char* WIFI_PASS     = "12346789";
-const char* SERVER_URL    = "http://10.175.187.25:8000/robot-command";
-
-const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
-unsigned long       lastWifiAttemptMs          = 0;
-
 // ======================== TIMING ========================
-const unsigned long POLL_INTERVAL_MS    = 150;
-const unsigned long HTTP_TIMEOUT_MS     = 300;
 const unsigned long WATCHDOG_TIMEOUT_MS = 1000;
-const unsigned long US_STAGGER_MS       = 8;
-
-unsigned long lastPollMs     = 0;
 unsigned long lastValidCmdMs = 0;
 
 // ======================== LEFT BTS7960 ========================
@@ -53,28 +36,21 @@ unsigned long lastValidCmdMs = 0;
 #define R_EN    14
 
 // ======================== ULTRASONIC SENSORS ========================
-// FRONT
 #define US_FRONT_TRIG  4
 #define US_FRONT_ECHO  16
-// LEFT
 #define US_LEFT_TRIG   5
 #define US_LEFT_ECHO   17
-// RIGHT
 #define US_RIGHT_TRIG  19
 #define US_RIGHT_ECHO  21
 
 // ── Safety thresholds (cm) ──
-#define HARD_STOP_CM         20   // Layer 1: FRONT < 20 → full stop
-#define SOFT_SLOW_CM         50   // Layer 4: FRONT 20-50 → 60% PWM
-#define SIDE_DANGER_CM       15   // Layer 2/3: side collision zone
-#define SERVO_TRIGGER_CM      8   // very close → trigger servo arm
+#define HARD_STOP_CM     20
+#define SOFT_SLOW_CM     50
+#define SIDE_DANGER_CM   15
 
 // ======================== SERVO ========================
 #define SERVO_PIN  18
 Servo avoidServo;
-bool  servoBusy          = false;
-const int SERVO_REST_DEG = 90;
-const int SERVO_ACT_DEG  = 180;
 
 // ======================== STATUS LED ========================
 #define STATUS_LED  2
@@ -84,34 +60,33 @@ const int SERVO_ACT_DEG  = 180;
 #define PWM_RES   8    // 0-255
 
 // ======================== SPEED PROFILES ========================
-#define SPEED_FULL    180
-#define SPEED_REDUCED 108   // 60% of full (Layer 4 slowdown)
-#define TURN_FAST     220
-#define TURN_SLOW      40
-#define TURN_SHARP    255
+#define SPEED_FULL    160
+#define SPEED_REDUCED 100
+#define TURN_SPEED    200
+#define SCAN_SPEED    160   // PWM for 360° scan rotation
+
+// ======================== SCAN CONFIG ========================
+#define SCAN_DURATION_MS  3000  // tune for exact 360°
+bool scanInProgress = false;
 
 // ======================== STATE ========================
-String currentCmd      = "STOP";
-String previousCmd     = "STOP";
-long   dFront          = -1;
-long   dLeft           = -1;
-long   dRight          = -1;
-bool   watchdogTripped = false;
-String safetyOverride  = "";   // tracks which safety layer is active
+String currentCmd = "STOP";
+long   dFront     = -1;
+long   dLeft      = -1;
+long   dRight     = -1;
 
 // ======================== FORWARD DECLARATIONS ========================
-void  pollServer();
-void  applyCommand(const String& cmd);
-long  readUltrasonic(int trigPin, int echoPin);
-void  readAllSensors();
-bool  ensureWiFi();
-void  triggerServo();
+void  readSerialCommand();
+void  readSensors();
+void  applyCommand(String cmd);
+long  readUltrasonic(int trig, int echo);
 void  emergencyStop();
 void  moveForward(int speed);
 void  moveBackward(int speed);
-void  turnLeft(int innerSpeed, int outerSpeed);
-void  turnRight(int innerSpeed, int outerSpeed);
-void  blinkLED(int count, int onMs);
+void  turnLeft(int speed);
+void  turnRight(int speed);
+void  spinInPlace(int speed);
+void  executeScan();
 
 // ============================================================
 //                          SETUP
@@ -120,7 +95,8 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println("\n========================================");
-  Serial.println("  Guido Campus Robot — ESP32 v2.0");
+  Serial.println("  Guido Campus Robot — Serial USB Mode");
+  Serial.println("  COM9 @ 115200 baud");
   Serial.println("  STARTS IN STOP MODE (no movement)");
   Serial.println("========================================");
 
@@ -136,7 +112,6 @@ void setup() {
   ledcAttach(R_RPWM, PWM_FREQ, PWM_RES);
   ledcAttach(R_LPWM, PWM_FREQ, PWM_RES);
 
-  // Start STOPPED — robot does NOT move at boot
   emergencyStop();
 
   // Ultrasonic pins
@@ -149,261 +124,153 @@ void setup() {
 
   // Servo
   avoidServo.attach(SERVO_PIN);
-  avoidServo.write(SERVO_REST_DEG);
 
   // Status LED
   pinMode(STATUS_LED, OUTPUT);
   digitalWrite(STATUS_LED, LOW);
 
-  // WiFi
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  Serial.printf("[WiFi] Connecting to %s\n", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
-    delay(400);
-    Serial.print(".");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] Connected — IP: %s\n", WiFi.localIP().toString().c_str());
-    blinkLED(3, 150);
-  } else {
-    Serial.println("\n[WiFi] FAILED — will retry in loop");
-    blinkLED(6, 80);
-  }
-
   lastValidCmdMs = millis();
-  Serial.println("[BOOT] Ready — waiting for mission from Python server\n");
+  Serial.println("[BOOT] Ready — send commands via Serial\n");
 }
 
 // ============================================================
 //                         MAIN LOOP
 // ============================================================
 void loop() {
-  unsigned long now = millis();
+  // 1. Read ultrasonic sensors
+  readSensors();
 
-  // Rate-limit
-  if (now - lastPollMs < POLL_INTERVAL_MS) return;
-  lastPollMs = now;
+  // 2. Read command from Serial (laptop Python → USB → ESP32)
+  readSerialCommand();
 
-  // 1. WiFi (non-blocking reconnect)
-  bool online = ensureWiFi();
-
-  // 2. Read ultrasonic sensors
-  readAllSensors();
-
-  // 3. Poll vision server
-  if (online) {
-    pollServer();
-  }
-
-  // 4. Watchdog: auto-stop if no valid command for >1 s
-  if (now - lastValidCmdMs > WATCHDOG_TIMEOUT_MS) {
-    if (!watchdogTripped) {
-      Serial.println("[WATCHDOG] No valid command — forcing STOP");
-      watchdogTripped = true;
-    }
+  // 3. Watchdog: auto-stop if no valid command for >1 s
+  if (millis() - lastValidCmdMs > WATCHDOG_TIMEOUT_MS) {
     currentCmd = "STOP";
   }
 
-  // 5. Execute with safety overrides
+  // 4. Execute with safety overrides
   applyCommand(currentCmd);
 
-  // 6. Status LED: solid = moving, off = stopped
+  // 5. Status LED: solid = moving, off = stopped
   digitalWrite(STATUS_LED, currentCmd != "STOP" ? HIGH : LOW);
 }
 
 // ============================================================
-//                     WIFI RECONNECT
+//                  SERIAL COMMAND READING
+//   Laptop sends newline-terminated commands:
+//     CRUISE, STOP, LEFT, RIGHT, BACK, SCAN,
+//     PREFER_LEFT, PREFER_RIGHT
 // ============================================================
-bool ensureWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return true;
+void readSerialCommand() {
+  if (!Serial.available()) return;
 
-  unsigned long now = millis();
-  if (now - lastWifiAttemptMs < WIFI_RECONNECT_INTERVAL_MS) return false;
-  lastWifiAttemptMs = now;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
 
-  Serial.println("[WiFi] Reconnecting...");
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  return false;
+  if (cmd.length() == 0) return;
+
+  // Validate known commands
+  if (cmd == "CRUISE"       || cmd == "STOP"         ||
+      cmd == "PREFER_LEFT"  || cmd == "PREFER_RIGHT" ||
+      cmd == "LEFT"         || cmd == "RIGHT"        ||
+      cmd == "BACK"         || cmd == "SCAN") {
+
+    currentCmd     = cmd;
+    lastValidCmdMs = millis();
+    Serial.print("[CMD] ");
+    Serial.println(currentCmd);
+  } else {
+    Serial.print("[CMD] Unknown: ");
+    Serial.println(cmd);
+  }
 }
 
 // ============================================================
 //                    ULTRASONIC READING
 // ============================================================
-long readUltrasonic(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW);
+long readUltrasonic(int trig, int echo) {
+  digitalWrite(trig, LOW);
   delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
+  digitalWrite(trig, HIGH);
   delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
+  digitalWrite(trig, LOW);
 
-  // 20 ms timeout ≈ 340 cm max range
-  long duration = pulseIn(echoPin, HIGH, 20000);
-  if (duration == 0) return -1;  // no echo
+  long duration = pulseIn(echo, HIGH, 20000);
+  if (duration == 0) return -1;
 
-  long cm = (duration * 343L) / 20000;
-  return cm;
+  return duration * 0.034 / 2;
 }
 
-void readAllSensors() {
+void readSensors() {
   dFront = readUltrasonic(US_FRONT_TRIG, US_FRONT_ECHO);
-  delay(US_STAGGER_MS);
+  delay(5);
   dLeft  = readUltrasonic(US_LEFT_TRIG,  US_LEFT_ECHO);
-  delay(US_STAGGER_MS);
+  delay(5);
   dRight = readUltrasonic(US_RIGHT_TRIG, US_RIGHT_ECHO);
 
-  Serial.printf("[US] F=%3ld  L=%3ld  R=%3ld cm\n", dFront, dLeft, dRight);
+  Serial.printf("[US] F:%ld L:%ld R:%ld\n", dFront, dLeft, dRight);
 }
 
 // ============================================================
-//                     SERVER POLLING
+//     COMMAND EXECUTION + SAFETY LAYERS
 // ============================================================
-void pollServer() {
-  HTTPClient http;
-  http.begin(SERVER_URL);
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  http.addHeader("Content-Type", "application/json");
+void applyCommand(String cmd) {
 
-  int code = http.POST("{}");
-
-  if (code == 200) {
-    String body = http.getString();
-    StaticJsonDocument<256> doc;
-    DeserializationError err = deserializeJson(doc, body);
-
-    if (!err && doc.containsKey("command")) {
-      String newCmd = doc["command"].as<String>();
-
-      if (newCmd == "CRUISE"       || newCmd == "STOP"         ||
-          newCmd == "PREFER_LEFT"  || newCmd == "PREFER_RIGHT" ||
-          newCmd == "LEFT"         || newCmd == "RIGHT"        ||
-          newCmd == "BACK") {
-
-        previousCmd    = currentCmd;
-        currentCmd     = newCmd;
-        lastValidCmdMs = millis();
-        watchdogTripped = false;
-
-        if (currentCmd != previousCmd) {
-          Serial.printf("[CMD] %s → %s\n", previousCmd.c_str(), currentCmd.c_str());
-        }
-      } else {
-        Serial.printf("[CMD] Unknown: %s\n", newCmd.c_str());
-      }
-    } else {
-      Serial.printf("[CMD] Parse error: %s\n", err.c_str());
-    }
-  } else if (code > 0) {
-    Serial.printf("[HTTP] Error: %d\n", code);
-  } else {
-    Serial.printf("[HTTP] Failed: %s\n", http.errorToString(code).c_str());
-  }
-
-  http.end();
-}
-
-// ============================================================
-//        COMMAND EXECUTION + 5-LAYER SAFETY SYSTEM
-// ============================================================
-void applyCommand(const String& cmd) {
-  safetyOverride = "";
-
-  // ────────────────────────────────────────────
-  //  LAYER 1: HARD STOP — FRONT < 20 cm
-  //  Highest priority. Immediate full stop.
-  // ────────────────────────────────────────────
+  // ── LAYER 1: HARD STOP — FRONT < 20 cm ──
   if (dFront != -1 && dFront < HARD_STOP_CM) {
-    safetyOverride = "L1_HARD_STOP";
-    emergencyStop();
-
-    if (dFront < SERVO_TRIGGER_CM) {
-      triggerServo();
-    }
-
     Serial.printf("[SAFETY L1] HARD STOP — front=%ld cm\n", dFront);
+    emergencyStop();
     return;
   }
 
-  // ────────────────────────────────────────────
-  //  LAYER 2: DEADLOCK — LEFT < 15 AND RIGHT < 15
-  //  Both sides blocked → cannot turn → STOP.
-  // ────────────────────────────────────────────
+  // ── LAYER 2: DEADLOCK — both sides blocked ──
   bool leftDanger  = (dLeft  != -1 && dLeft  < SIDE_DANGER_CM);
   bool rightDanger = (dRight != -1 && dRight < SIDE_DANGER_CM);
 
   if (leftDanger && rightDanger && cmd != "STOP" && cmd != "BACK") {
-    safetyOverride = "L2_DEADLOCK";
+    Serial.printf("[SAFETY L2] DEADLOCK — L=%ld R=%ld\n", dLeft, dRight);
     emergencyStop();
-    Serial.printf("[SAFETY L2] DEADLOCK — L=%ld R=%ld cm\n", dLeft, dRight);
     return;
   }
 
-  // ────────────────────────────────────────────
-  //  LAYER 3: SIDE COLLISION AVOIDANCE
-  //  LEFT < 15 → force turn right
-  //  RIGHT < 15 → force turn left
-  // ────────────────────────────────────────────
+  // ── LAYER 3: SIDE COLLISION AVOIDANCE ──
   if (cmd != "STOP" && cmd != "BACK") {
     if (leftDanger) {
-      safetyOverride = "L3_LEFT_AVOID";
-      Serial.printf("[SAFETY L3] Left obstacle=%ld → turn RIGHT\n", dLeft);
-      turnRight(TURN_SLOW, TURN_FAST);
+      Serial.printf("[SAFETY L3] Left=%ld → turn RIGHT\n", dLeft);
+      turnRight(TURN_SPEED);
       return;
     }
     if (rightDanger) {
-      safetyOverride = "L3_RIGHT_AVOID";
-      Serial.printf("[SAFETY L3] Right obstacle=%ld → turn LEFT\n", dRight);
-      turnLeft(TURN_SLOW, TURN_FAST);
+      Serial.printf("[SAFETY L3] Right=%ld → turn LEFT\n", dRight);
+      turnLeft(TURN_SPEED);
       return;
     }
   }
 
-  // ────────────────────────────────────────────
-  //  LAYER 4: SOFT SLOWDOWN — FRONT 20–50 cm
-  //  Reduce forward PWM to 60%.
-  // ────────────────────────────────────────────
+  // ── LAYER 4: SOFT SLOWDOWN — FRONT 20–50 cm ──
   bool frontSlow = (dFront != -1 && dFront < SOFT_SLOW_CM);
   int  fwdSpeed  = frontSlow ? SPEED_REDUCED : SPEED_FULL;
 
-  if (frontSlow) {
-    safetyOverride = "L4_SLOWDOWN";
-  }
+  // ── LAYER 5: WATCHDOG — handled in loop() ──
 
-  // ────────────────────────────────────────────
-  //  LAYER 5: WATCHDOG — handled in loop()
-  //  (currentCmd forced to STOP above)
-  // ────────────────────────────────────────────
-
-  // ────────────────────────────────────────────
-  //  LAYER 6: EXECUTE VISION SERVER COMMAND
-  // ────────────────────────────────────────────
+  // ── LAYER 6: EXECUTE COMMAND ──
   if (cmd == "CRUISE") {
     moveForward(fwdSpeed);
   }
-  else if (cmd == "PREFER_LEFT") {
-    // Camera mirror: vision "left" → robot physical left obstacle → steer RIGHT
-    turnRight(TURN_SLOW, frontSlow ? SPEED_REDUCED : TURN_FAST);
+  else if (cmd == "PREFER_LEFT" || cmd == "LEFT") {
+    turnLeft(TURN_SPEED);
   }
-  else if (cmd == "PREFER_RIGHT") {
-    // Camera mirror: vision "right" → robot physical right obstacle → steer LEFT
-    turnLeft(TURN_SLOW, frontSlow ? SPEED_REDUCED : TURN_FAST);
-  }
-  else if (cmd == "LEFT") {
-    turnLeft(0, TURN_SHARP);
-  }
-  else if (cmd == "RIGHT") {
-    turnRight(0, TURN_SHARP);
+  else if (cmd == "PREFER_RIGHT" || cmd == "RIGHT") {
+    turnRight(TURN_SPEED);
   }
   else if (cmd == "BACK") {
     moveBackward(SPEED_REDUCED);
   }
+  else if (cmd == "SCAN") {
+    executeScan();
+  }
   else {
-    // STOP or unknown → safe stop
+    // STOP or unknown
     emergencyStop();
   }
 }
@@ -433,42 +300,50 @@ void moveBackward(int speed) {
   ledcWrite(R_LPWM, speed);
 }
 
-void turnLeft(int innerSpeed, int outerSpeed) {
-  ledcWrite(L_RPWM, innerSpeed);
-  ledcWrite(L_LPWM, 0);
-  ledcWrite(R_RPWM, outerSpeed);
+// Pivot LEFT — left wheels backward, right wheels forward
+void turnLeft(int speed) {
+  ledcWrite(L_RPWM, 0);
+  ledcWrite(L_LPWM, speed);
+  ledcWrite(R_RPWM, speed);
   ledcWrite(R_LPWM, 0);
 }
 
-void turnRight(int innerSpeed, int outerSpeed) {
-  ledcWrite(L_RPWM, outerSpeed);
+// Pivot RIGHT — left wheels forward, right wheels backward
+void turnRight(int speed) {
+  ledcWrite(L_RPWM, speed);
   ledcWrite(L_LPWM, 0);
-  ledcWrite(R_RPWM, innerSpeed);
+  ledcWrite(R_RPWM, 0);
+  ledcWrite(R_LPWM, speed);
+}
+
+// ============================================================
+//                 SPIN-IN-PLACE (for SCAN)
+// ============================================================
+
+void spinInPlace(int speed) {
+  // Same as turnLeft — clockwise pivot
+  ledcWrite(L_RPWM, 0);
+  ledcWrite(L_LPWM, speed);
+  ledcWrite(R_RPWM, speed);
   ledcWrite(R_LPWM, 0);
 }
 
-// ============================================================
-//                        SERVO
-// ============================================================
-void triggerServo() {
-  if (servoBusy) return;
-  servoBusy = true;
-  Serial.println("[SERVO] Triggered — obstacle very close!");
-  avoidServo.write(SERVO_ACT_DEG);
-  delay(400);
-  avoidServo.write(SERVO_REST_DEG);
-  delay(300);
-  servoBusy = false;
-}
+void executeScan() {
+  if (scanInProgress) return;
+  scanInProgress = true;
 
-// ============================================================
-//                      STATUS LED
-// ============================================================
-void blinkLED(int count, int onMs) {
-  for (int i = 0; i < count; i++) {
-    digitalWrite(STATUS_LED, HIGH);
-    delay(onMs);
-    digitalWrite(STATUS_LED, LOW);
-    delay(onMs);
-  }
+  Serial.println("[SCAN] ---- 360 deg SCAN started ----");
+  digitalWrite(STATUS_LED, HIGH);
+
+  spinInPlace(SCAN_SPEED);
+  delay(SCAN_DURATION_MS);
+
+  emergencyStop();
+  digitalWrite(STATUS_LED, LOW);
+
+  currentCmd     = "STOP";
+  lastValidCmdMs = millis();
+
+  Serial.println("[SCAN] ---- 360 deg SCAN complete ----");
+  scanInProgress = false;
 }
