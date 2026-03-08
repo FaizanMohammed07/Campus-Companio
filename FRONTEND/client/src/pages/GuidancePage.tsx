@@ -1,14 +1,30 @@
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, ChevronUp, MapPin, Zap, Check } from "lucide-react";
+import { ArrowLeft, Navigation, AlertTriangle, User, Check, Loader2 } from "lucide-react";
 import { Link } from "wouter";
 import { useVoiceController } from "@/context/VoiceController";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 
+/* ─── Types matching GET /api/status response ─── */
+type RobotStatus = {
+  mode: "IDLE" | "GUIDE";
+  destination: string | null;
+  pipeline_healthy: boolean;
+  nav_state: string;
+  intent: string;
+  person_detected: boolean;
+  person_zone: string;
+  confidence: number;
+  nav_obstacles: number;
+  nav_paths: number;
+};
+
 export default function GuidancePage({ params }: { params: { id: string } }) {
-  const { destination, directions } = useVoiceController();
-  const [currentStep, setCurrentStep] = useState(0);
+  const { destination } = useVoiceController();
+  const [status, setStatus] = useState<RobotStatus | null>(null);
+  const [connected, setConnected] = useState(false);
   const [completed, setCompleted] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const locationConfig: Record<string, { name: string; icon: string; color: string }> = {
     FEE: { name: "Fee Payment Counter", icon: "💰", color: "from-amber-500 to-orange-600" },
@@ -17,22 +33,75 @@ export default function GuidancePage({ params }: { params: { id: string } }) {
     LIBRARY: { name: "Central Library", icon: "📚", color: "from-purple-500 to-pink-600" },
     EXAM: { name: "Exam Cell", icon: "🧑‍💼", color: "from-red-500 to-rose-600" },
     CANTEEN: { name: "Canteen & Food Court", icon: "🍽", color: "from-green-500 to-emerald-600" },
+    A_BLOCK: { name: "A Block", icon: "🏫", color: "from-teal-500 to-cyan-600" },
+    B_BLOCK: { name: "B Block", icon: "🏫", color: "from-indigo-500 to-violet-600" },
+    C_BLOCK: { name: "C Block", icon: "🏫", color: "from-rose-500 to-pink-600" },
   };
 
   const locId = destination || params.id;
   const config = locationConfig[locId] || { name: locId, icon: "📍", color: "from-primary to-primary" };
-  const dirList = directions || [];
 
-  const isLastStep = currentStep === dirList.length - 1;
-  const currentDirection = dirList[currentStep] || "";
-  const progress = dirList.length > 0 ? ((currentStep + 1) / dirList.length) * 100 : 0;
+  /* ─── Poll /api/status every 500ms ─── */
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const res = await fetch("/api/status");
+        if (res.ok) {
+          const json = await res.json();
+          const data: RobotStatus = json.data || json;
+          setStatus(data);
+          setConnected(true);
 
-  const handleNext = () => {
-    if (isLastStep) {
-      setCompleted(true);
-    } else {
-      setCurrentStep(Math.min(dirList.length - 1, currentStep + 1));
-    }
+          if (data.nav_state === "ARRIVED") {
+            setCompleted(true);
+          }
+        } else {
+          setConnected(false);
+        }
+      } catch {
+        setConnected(false);
+      }
+    };
+
+    // Immediate first poll
+    void poll();
+    pollRef.current = setInterval(poll, 500);
+
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, []);
+
+  /* ─── Stop mission on unmount (leaving page = cancel) ─── */
+  useEffect(() => {
+    return () => {
+      if (!completed) {
+        fetch("/api/stop", { method: "POST" }).catch(() => {});
+      }
+    };
+  }, [completed]);
+
+  /* ─── Helper: readable nav state label ─── */
+  const navStateLabel = (s: string) => {
+    const labels: Record<string, string> = {
+      IDLE: "Waiting",
+      SEARCH_PATH: "Searching for path…",
+      ALIGN_PATH: "Aligning to path…",
+      FORWARD: "Moving forward",
+      AVOID_OBSTACLE: "Avoiding obstacle…",
+      ARRIVED: "Arrived! 🎉",
+      EMERGENCY_STOP: "⚠️ Emergency Stop",
+    };
+    return labels[s] || s;
+  };
+
+  /* ─── Nav state color ─── */
+  const navStateColor = (s: string) => {
+    if (s === "FORWARD") return "text-green-400";
+    if (s === "ARRIVED") return "text-emerald-400";
+    if (s === "EMERGENCY_STOP") return "text-red-400";
+    if (s === "AVOID_OBSTACLE") return "text-yellow-400";
+    return "text-cyan-400";
   };
 
   return (
@@ -58,131 +127,124 @@ export default function GuidancePage({ params }: { params: { id: string } }) {
           <h1 className="text-2xl font-bold flex items-center gap-2 mb-1">
             {config.icon} {config.name}
           </h1>
-          <p className="text-xs text-cyan-300">AR Navigation Active</p>
+          <div className="flex items-center gap-2 text-xs">
+            <span className={`inline-block w-2 h-2 rounded-full ${connected ? "bg-green-400" : "bg-red-400"}`} />
+            <span className={connected ? "text-green-300" : "text-red-300"}>
+              {connected ? "Robot Connected" : "Connecting…"}
+            </span>
+          </div>
         </div>
       </motion.div>
 
       {/* Main Content */}
       <main className="relative z-10 px-6 pt-8 pb-32 max-w-2xl mx-auto">
-        {/* Progress Circle */}
+        {/* Live Status Circle */}
         <motion.div
           initial={{ scale: 0.8, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
           transition={{ delay: 0.1 }}
-          className="flex justify-center mb-12"
+          className="flex justify-center mb-10"
         >
-          <div className="relative w-32 h-32">
-            <svg className="w-full h-full transform -rotate-90" viewBox="0 0 120 120">
-              {/* Background circle */}
-              <circle cx="60" cy="60" r="50" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="4" />
-              {/* Progress circle */}
-              <motion.circle
-                cx="60"
-                cy="60"
-                r="50"
-                fill="none"
-                stroke="url(#progressGradient)"
-                strokeWidth="4"
-                strokeLinecap="round"
-                pathLength={100}
-                initial={{ pathLength: 0 }}
-                animate={{ pathLength: progress }}
-                transition={{ duration: 0.8, ease: "easeInOut" }}
-                strokeDasharray={100}
+          <div className="relative w-40 h-40">
+            {/* Rotating ring when moving */}
+            {status?.nav_state === "FORWARD" && (
+              <motion.div
+                animate={{ rotate: 360 }}
+                transition={{ duration: 3, repeat: Infinity, ease: "linear" }}
+                className="absolute -inset-2 border-2 border-dashed border-green-400/40 rounded-full"
               />
-              <defs>
-                <linearGradient id="progressGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                  <stop offset="0%" stopColor="#06b6d4" />
-                  <stop offset="100%" stopColor="#3b82f6" />
-                </linearGradient>
-              </defs>
-            </svg>
-            {/* Center text */}
-            <div className="absolute inset-0 flex flex-col items-center justify-center">
-              <div className="text-4xl font-bold text-cyan-400">{currentStep + 1}</div>
-              <div className="text-xs text-gray-400">of {dirList.length}</div>
+            )}
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-gradient-to-br from-white/10 to-white/5 backdrop-blur-xl border border-white/20 rounded-full">
+              {!status ? (
+                <Loader2 className="w-10 h-10 text-cyan-400 animate-spin" />
+              ) : (
+                <>
+                  <Navigation className={`w-10 h-10 mb-2 ${navStateColor(status.nav_state)}`} />
+                  <span className={`text-sm font-bold ${navStateColor(status.nav_state)}`}>
+                    {navStateLabel(status.nav_state)}
+                  </span>
+                </>
+              )}
             </div>
           </div>
         </motion.div>
 
-        {/* Current Instruction */}
-        <AnimatePresence mode="wait">
+        {/* Live Telemetry Cards */}
+        {status && (
           <motion.div
-            key={currentStep}
-            initial={{ opacity: 0, y: 30, scale: 0.9 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: -30, scale: 0.9 }}
-            transition={{ duration: 0.4 }}
-            className="mb-12"
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.2 }}
+            className="grid grid-cols-2 gap-4 mb-8"
           >
-            {/* Direction Card */}
-            <div className="relative mb-8">
-              <motion.div
-                animate={{ rotate: 360 }}
-                transition={{ duration: 8, repeat: Infinity, ease: "linear" }}
-                className="absolute -inset-1 bg-gradient-to-r from-cyan-500 via-blue-500 to-purple-500 rounded-3xl opacity-30 blur-xl"
-              />
-              <div className="relative bg-gradient-to-br from-white/10 to-white/5 backdrop-blur-xl border border-white/20 rounded-3xl p-8">
-                <motion.div
-                  animate={{ y: [0, -10, 0] }}
-                  transition={{ duration: 3, repeat: Infinity }}
-                  className="text-6xl text-center mb-4 drop-shadow-lg"
-                >
-                  <ChevronUp className="w-16 h-16 mx-auto text-cyan-400" />
-                </motion.div>
-                <p className="text-xl font-bold text-center text-white leading-relaxed mb-2">
-                  {currentDirection}
-                </p>
-                <div className="text-center text-sm text-cyan-300 font-semibold">
-                  Step {currentStep + 1} of {dirList.length}
+            {/* Person Detection */}
+            <div className={`rounded-2xl p-4 border ${status.person_detected ? "bg-yellow-500/10 border-yellow-500/30" : "bg-white/5 border-white/10"}`}>
+              <div className="flex items-center gap-2 mb-1">
+                <User className={`w-4 h-4 ${status.person_detected ? "text-yellow-400" : "text-gray-500"}`} />
+                <span className="text-xs font-semibold text-gray-400">Person</span>
+              </div>
+              <p className={`text-lg font-bold ${status.person_detected ? "text-yellow-300" : "text-gray-500"}`}>
+                {status.person_detected ? status.person_zone : "Clear"}
+              </p>
+            </div>
+
+            {/* Intent */}
+            <div className="rounded-2xl p-4 bg-white/5 border border-white/10">
+              <div className="flex items-center gap-2 mb-1">
+                <Navigation className="w-4 h-4 text-cyan-400" />
+                <span className="text-xs font-semibold text-gray-400">Intent</span>
+              </div>
+              <p className="text-lg font-bold text-cyan-300">{status.intent}</p>
+            </div>
+
+            {/* Confidence */}
+            <div className="rounded-2xl p-4 bg-white/5 border border-white/10">
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-xs font-semibold text-gray-400">Confidence</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="flex-1 h-2 bg-white/10 rounded-full overflow-hidden">
+                  <motion.div
+                    className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full"
+                    animate={{ width: `${(status.confidence * 100).toFixed(0)}%` }}
+                    transition={{ duration: 0.3 }}
+                  />
                 </div>
+                <span className="text-sm font-bold text-cyan-300">
+                  {(status.confidence * 100).toFixed(0)}%
+                </span>
               </div>
             </div>
 
-            {/* Step Indicator Dots */}
-            <div className="flex justify-center gap-3 mb-8">
-              {dirList.map((_, idx) => (
-                <motion.div
-                  key={idx}
-                  animate={{
-                    scale: idx === currentStep ? 1.3 : 1,
-                    opacity: idx <= currentStep ? 1 : 0.4,
-                  }}
-                  transition={{ duration: 0.3 }}
-                  className={`h-3 rounded-full ${
-                    idx < currentStep
-                      ? "w-3 bg-gradient-to-r from-cyan-500 to-blue-500"
-                      : idx === currentStep
-                        ? "w-8 bg-gradient-to-r from-cyan-400 to-blue-400 shadow-lg shadow-cyan-500/50"
-                        : "w-3 bg-white/20"
-                  }`}
-                />
-              ))}
+            {/* Pipeline Health */}
+            <div className={`rounded-2xl p-4 border ${status.pipeline_healthy ? "bg-green-500/10 border-green-500/30" : "bg-red-500/10 border-red-500/30"}`}>
+              <div className="flex items-center gap-2 mb-1">
+                {status.pipeline_healthy ? (
+                  <Check className="w-4 h-4 text-green-400" />
+                ) : (
+                  <AlertTriangle className="w-4 h-4 text-red-400" />
+                )}
+                <span className="text-xs font-semibold text-gray-400">Pipeline</span>
+              </div>
+              <p className={`text-lg font-bold ${status.pipeline_healthy ? "text-green-300" : "text-red-300"}`}>
+                {status.pipeline_healthy ? "Healthy" : "Error"}
+              </p>
             </div>
           </motion.div>
-        </AnimatePresence>
+        )}
 
-        {/* Floating particles */}
-        <div className="relative h-16 mb-8">
-          {[0, 1, 2].map((i) => (
-            <motion.div
-              key={i}
-              className="absolute w-2 h-2 bg-cyan-400 rounded-full"
-              animate={{
-                y: [0, -100, 0],
-                opacity: [0, 1, 0],
-                x: Math.cos((i / 3) * Math.PI * 2) * 30,
-              }}
-              transition={{
-                duration: 2,
-                delay: i * 0.2,
-                repeat: Infinity,
-                ease: "easeInOut",
-              }}
-              style={{ left: "50%", translateX: "-50%" }}
-            />
-          ))}
-        </div>
+        {/* Emergency Stop Info */}
+        {status?.nav_state === "EMERGENCY_STOP" && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="mb-8 p-4 bg-red-500/20 border border-red-500/40 rounded-2xl text-center"
+          >
+            <AlertTriangle className="w-8 h-8 text-red-400 mx-auto mb-2" />
+            <p className="text-red-300 font-bold">Emergency Stop Active</p>
+            <p className="text-red-300/70 text-sm mt-1">The robot has stopped for safety. Clear the obstruction or press stop to cancel.</p>
+          </motion.div>
+        )}
 
         {/* Action Buttons */}
         <motion.div
@@ -191,25 +253,28 @@ export default function GuidancePage({ params }: { params: { id: string } }) {
           transition={{ delay: 0.3 }}
           className="fixed bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-slate-900 via-slate-900 to-transparent"
         >
-          <div className="max-w-2xl mx-auto grid grid-cols-2 gap-4">
+          <div className="max-w-2xl mx-auto space-y-2">
+            <Link href="/perception">
+              <Button
+                size="lg"
+                variant="outline"
+                className="w-full rounded-xl h-12 border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/10 hover:border-cyan-500/60 font-semibold"
+              >
+                👁️ View Live Detections & Camera Feed
+              </Button>
+            </Link>
             <Button
               size="lg"
               variant="outline"
-              className="rounded-xl h-14 border-white/20 text-white hover:bg-white/10 hover:border-white/40 disabled:opacity-50 disabled:cursor-not-allowed"
-              onClick={() => setCurrentStep(Math.max(0, currentStep - 1))}
-              disabled={currentStep === 0}
+              className="w-full rounded-xl h-14 border-red-500/40 text-red-300 hover:bg-red-500/10 hover:border-red-500/60 font-bold"
+              onClick={async () => {
+                try {
+                  await fetch("/api/stop", { method: "POST" });
+                } catch {}
+              }}
             >
-              ← Back
+              🛑 Stop Robot
             </Button>
-            <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
-              <Button
-                size="lg"
-                className="w-full rounded-xl h-14 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-600 hover:to-blue-700 font-bold"
-                onClick={handleNext}
-              >
-                {isLastStep ? "Arrive! 🎉" : "Next Step →"}
-              </Button>
-            </motion.div>
           </div>
         </motion.div>
       </main>
@@ -235,20 +300,13 @@ export default function GuidancePage({ params }: { params: { id: string } }) {
                 <motion.div
                   key={i}
                   className="absolute w-3 h-3 bg-cyan-400 rounded-full"
-                  initial={{
-                    x: 0,
-                    y: 0,
-                    opacity: 1,
-                  }}
+                  initial={{ x: 0, y: 0, opacity: 1 }}
                   animate={{
                     x: (Math.random() - 0.5) * 200,
                     y: (Math.random() - 0.5) * 200,
                     opacity: 0,
                   }}
-                  transition={{
-                    duration: 2,
-                    ease: "easeOut",
-                  }}
+                  transition={{ duration: 2, ease: "easeOut" }}
                 />
               ))}
 
@@ -262,9 +320,7 @@ export default function GuidancePage({ params }: { params: { id: string } }) {
                   🎉
                 </motion.div>
                 <h2 className="text-4xl font-bold text-white mb-3">You've Arrived!</h2>
-                <p className="text-xl text-green-50 mb-8">
-                  {config.name}
-                </p>
+                <p className="text-xl text-green-50 mb-8">{config.name}</p>
                 <p className="text-sm text-green-100 mb-8 font-semibold">
                   ✓ Guidance Complete • Navigation Successful
                 </p>

@@ -243,4 +243,21 @@ app.use((req, res, next) => {
   }
 
   await attemptListen();
+
+  // ── Graceful shutdown ──
+  const shutdown = (signal: string) => {
+    logInfo("shutdown_initiated", { signal });
+    httpServer.close(() => {
+      logInfo("server_closed");
+      process.exit(0);
+    });
+    // Force exit after 5 seconds
+    setTimeout(() => {
+      logWarn("shutdown_timeout", { message: "Forcing exit after 5s" });
+      process.exit(1);
+    }, 5000);
+  };
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 })();

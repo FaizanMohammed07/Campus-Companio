@@ -1,707 +1,518 @@
-import { useEffect, useRef, useState } from "react";
-import * as ort from "onnxruntime-web";
+import { useEffect, useState, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { useToast } from "@/hooks/use-toast";
+import { Link } from "wouter";
+import {
+  ArrowLeft, RefreshCw, CheckCircle, XCircle, AlertTriangle,
+  Eye, Camera, Cpu, Wifi, Zap, Shield, Navigation, User,
+  Activity, Radio, ArrowRight, ChevronDown, ChevronUp,
+} from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
 
-// Model configuration
-const MODEL_URL = "/models/best.onnx"; // exported from your trained weights
-const CLASSES_URL = "/models/classes.json"; // names from data.yaml
-const INPUT_SIZE = 320; // small for mobile performance
-const SCORE_THRESHOLD = 0.35;
-const NMS_IOU_THRESHOLD = 0.45;
-const COMMAND_FREQ_MS = 150; // ~6-7 Hz
+/**
+ * Perception – Full YOLO Detection Dashboard + Command Pipeline Monitor.
+ *
+ * Shows:
+ *  1. Live annotated camera feed (YOLO boxes drawn by Python)
+ *  2. Person model detections list
+ *  3. Navigation model detections list
+ *  4. Current ESP32 command + pipeline flow diagram
+ *  5. System health & event log
+ *
+ * This page does NOT send any motor commands.
+ * All navigation authority lives in the Python Vision Server.
+ */
 
-// Classes of interest (subset)
-const TARGET_CLASSES = ["person", "chair", "bench", "backpack", "umbrella"];
+// ── Types ─────────────────────────────────────────────
 
-type SymbolicAction =
-  | "FORWARD"
-  | "LEFT"
-  | "RIGHT"
-  | "STOP"
-  | "ROTATE_LEFT"
-  | "ROTATE_RIGHT";
-type Command = {
-  action: SymbolicAction;
+type Detection = {
+  class: string;
+  x1: number; y1: number; x2: number; y2: number;
   confidence: number;
-  reason: "FREE_PATH" | "PERSON" | "OBSTACLE";
-  timestamp: number;
+  cx_norm?: number;
+  area_ratio?: number;
 };
 
-type WireCommand = {
-  action: SymbolicAction;
+type DetailedStatus = {
+  mode: "IDLE" | "GUIDE";
+  destination: string | null;
+  pipeline_healthy: boolean;
+  // Person model
+  person_detected: boolean;
+  person_ratio: number;
+  person_zone: string;
   confidence: number;
-  timestamp: number;
+  person_detections: Detection[];
+  // Nav model
+  nav_state: string;
+  intent: string;
+  nav_obstacles_count: number;
+  nav_paths_count: number;
+  nav_a_blocks_count: number;
+  nav_b_blocks_count: number;
+  nav_c_blocks_count: number;
+  nav_detections: Detection[];
+  // Pipeline
+  running: boolean;
+  frame_age_s: number;
+  inference_failures: number;
+  // Annotated frame
+  annotated_frame: string | null;
+  // Error fallback
+  error?: string;
 };
 
-function zoneFromX(x: number, width: number) {
-  const third = width / 3;
-  if (x < third) return "LEFT";
-  if (x < third * 2) return "CENTER";
-  return "RIGHT";
-}
+// ── Helpers ───────────────────────────────────────────
+
+const intentColor = (i: string) => {
+  const m: Record<string, string> = {
+    STOP: "text-red-400", CRUISE: "text-green-400",
+    PREFER_LEFT: "text-orange-400", PREFER_RIGHT: "text-orange-400",
+    LEFT: "text-yellow-400", RIGHT: "text-yellow-400", BACK: "text-purple-400",
+  };
+  return m[i] || "text-gray-400";
+};
+
+const intentBg = (i: string) => {
+  const m: Record<string, string> = {
+    STOP: "bg-red-500/20 border-red-500/40",
+    CRUISE: "bg-green-500/20 border-green-500/40",
+    PREFER_LEFT: "bg-orange-500/20 border-orange-500/40",
+    PREFER_RIGHT: "bg-orange-500/20 border-orange-500/40",
+    LEFT: "bg-yellow-500/20 border-yellow-500/40",
+    RIGHT: "bg-yellow-500/20 border-yellow-500/40",
+    BACK: "bg-purple-500/20 border-purple-500/40",
+  };
+  return m[i] || "bg-gray-500/20 border-gray-500/40";
+};
+
+const navStateColor = (s: string) => {
+  const m: Record<string, string> = {
+    IDLE: "bg-gray-500", SEARCH_PATH: "bg-blue-500", ALIGN_PATH: "bg-cyan-500",
+    FORWARD: "bg-green-500", AVOID_OBSTACLE: "bg-yellow-500",
+    ARRIVED: "bg-emerald-500", EMERGENCY_STOP: "bg-red-500",
+  };
+  return m[s] || "bg-gray-500";
+};
+
+const detClassColor = (c: string) => {
+  const m: Record<string, string> = {
+    person: "text-red-400 bg-red-500/10 border-red-500/30",
+    obstacle: "text-red-400 bg-red-500/10 border-red-500/30",
+    path: "text-green-400 bg-green-500/10 border-green-500/30",
+    a_block: "text-orange-400 bg-orange-500/10 border-orange-500/30",
+    b_block: "text-yellow-400 bg-yellow-500/10 border-yellow-500/30",
+    c_block: "text-blue-400 bg-blue-500/10 border-blue-500/30",
+  };
+  return m[c] || "text-gray-400 bg-gray-500/10 border-gray-500/30";
+};
+
+// ── Component ─────────────────────────────────────────
 
 export default function Perception() {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [running, setRunning] = useState(false);
-  const [session, setSession] = useState<ort.InferenceSession | null>(null);
-  const { toast } = useToast();
-  const [lastCommand, setLastCommand] = useState<Command | null>(null);
-  const [classMap, setClassMap] = useState<string[] | null>(null);
-  const [espEndpoint, setEspEndpoint] = useState<string>("/api/drive/command");
+  const [status, setStatus] = useState<DetailedStatus | null>(null);
+  const [healthy, setHealthy] = useState<boolean | null>(null);
+  const [polling, setPolling] = useState(true);
+  const [history, setHistory] = useState<string[]>([]);
+  const [showDetections, setShowDetections] = useState(true);
+  const [showPipeline, setShowPipeline] = useState(true);
+  const [fps, setFps] = useState(0);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fpsRef = useRef({ count: 0, lastTime: Date.now() });
 
-  // Camera init
+  /* ─── Poll /api/detailed-status at ~3 Hz ─── */
   useEffect(() => {
-    let stream: MediaStream | null = null;
-    (async () => {
+    if (!polling) {
+      if (pollRef.current) clearInterval(pollRef.current);
+      return;
+    }
+
+    const poll = async () => {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment" },
-          audio: false,
-        });
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play();
+        const res = await fetch("/api/detailed-status");
+        if (res.ok) {
+          const json = await res.json();
+          const data: DetailedStatus = json.data || json;
+          setStatus(data);
+          setHealthy(data.pipeline_healthy);
+
+          // FPS counter
+          fpsRef.current.count++;
+          const now = Date.now();
+          if (now - fpsRef.current.lastTime >= 1000) {
+            setFps(fpsRef.current.count);
+            fpsRef.current.count = 0;
+            fpsRef.current.lastTime = now;
+          }
+
+          // History log
+          setHistory((prev) => {
+            const entry = `${new Date().toLocaleTimeString()} | ${data.nav_state} | ${data.intent} | person=${data.person_detected} | det=${(data.nav_detections || []).length}`;
+            return [entry, ...prev].slice(0, 80);
+          });
+        } else {
+          setHealthy(false);
         }
-      } catch (e) {
-        toast({
-          title: "Camera error",
-          description: "Camera feed failed. STOP issued.",
-          variant: "destructive",
-        });
-        issueStop("CameraFailure");
+      } catch {
+        setHealthy(false);
       }
-    })();
+    };
+
+    void poll();
+    pollRef.current = setInterval(poll, 333); // ~3 Hz
+
     return () => {
-      stream?.getTracks().forEach((t) => t.stop());
+      if (pollRef.current) clearInterval(pollRef.current);
     };
-  }, []);
+  }, [polling]);
 
-  // Load class names and model
-  useEffect(() => {
-    (async () => {
-      try {
-        // Load class names
-        const resp = await fetch(CLASSES_URL);
-        if (resp.ok) {
-          const names = await resp.json();
-          if (Array.isArray(names)) setClassMap(names as string[]);
-        }
-      } catch {}
-
-      try {
-        // Ensure wasm assets resolve on mobile; fall back to CDN
-        (ort.env as any).wasm = (ort.env as any).wasm || {};
-        (ort.env as any).wasm.wasmPaths =
-          (ort as any).wasm?.wasmPaths ||
-          "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.0/dist/";
-        const s = await ort.InferenceSession.create(MODEL_URL, {
-          executionProviders: ["wasm"],
-          graphOptimizationLevel: "all",
-        });
-        setSession(s);
-      } catch (e) {
-        toast({
-          title: "Model error",
-          description: "Inference init failed. STOP issued.",
-          variant: "destructive",
-        });
-        issueStop("ModelInitFailure");
-      }
-    })();
-  }, []);
-
-  function issueStop(reason: string) {
-    const cmd: Command = {
-      action: "STOP",
-      confidence: 1.0,
-      reason: "OBSTACLE",
-      timestamp: Date.now(),
-    };
-    setLastCommand(cmd);
-    sendCommand(cmd, espEndpoint);
-  }
-
-  async function sendCommand(cmd: Command, endpoint: string) {
-    try {
-      const wire: WireCommand = {
-        action: cmd.action,
-        confidence: cmd.confidence,
-        timestamp: cmd.timestamp,
-      };
-      await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(wire),
-      });
-    } catch (e) {
-      // Network failure -> ESP32 should timeout-stop; we also stop locally
-      setRunning(false);
-    }
-  }
-
-  function preprocess(video: HTMLVideoElement) {
-    const c = canvasRef.current!;
-    const ctx = c.getContext("2d")!;
-    c.width = INPUT_SIZE;
-    c.height = INPUT_SIZE;
-    ctx.drawImage(video, 0, 0, INPUT_SIZE, INPUT_SIZE);
-    const imgData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE);
-    const { data } = imgData;
-    const floatData = new Float32Array(INPUT_SIZE * INPUT_SIZE * 3);
-    for (let i = 0; i < INPUT_SIZE * INPUT_SIZE; i++) {
-      floatData[i * 3 + 0] = data[i * 4 + 0] / 255;
-      floatData[i * 3 + 1] = data[i * 4 + 1] / 255;
-      floatData[i * 3 + 2] = data[i * 4 + 2] / 255;
-    }
-    const tensor = new ort.Tensor("float32", floatData, [
-      1,
-      3,
-      INPUT_SIZE,
-      INPUT_SIZE,
-    ]);
-    return { tensor, ctx };
-  }
-
-  function nms(boxes: number[][], scores: number[], iouThreshold: number) {
-    const idxs = scores
-      .map((s, i) => [s, i])
-      .sort((a, b) => b[0] - a[0])
-      .map(([_, i]) => i as number);
-    const selected: number[] = [];
-    function iou(a: number[], b: number[]) {
-      const ax1 = a[0],
-        ay1 = a[1],
-        ax2 = a[2],
-        ay2 = a[3];
-      const bx1 = b[0],
-        by1 = b[1],
-        bx2 = b[2],
-        by2 = b[3];
-      const interX1 = Math.max(ax1, bx1);
-      const interY1 = Math.max(ay1, by1);
-      const interX2 = Math.min(ax2, bx2);
-      const interY2 = Math.min(ay2, by2);
-      const interW = Math.max(0, interX2 - interX1);
-      const interH = Math.max(0, interY2 - interY1);
-      const interA = interW * interH;
-      const aA = Math.max(0, ax2 - ax1) * Math.max(0, ay2 - ay1);
-      const bA = Math.max(0, bx2 - bx1) * Math.max(0, by2 - by1);
-      const union = aA + bA - interA;
-      return union <= 0 ? 0 : interA / union;
-    }
-    for (const i of idxs) {
-      let keep = true;
-      for (const j of selected) {
-        if (iou(boxes[i], boxes[j]) > iouThreshold) {
-          keep = false;
-          break;
-        }
-      }
-      if (keep) selected.push(i);
-    }
-    return selected;
-  }
-
-  function decideFreeSpace(
-    detections: { box: number[]; cls: string; score: number }[],
-    width: number,
-    height: number,
-  ): Command {
-    const zones = { LEFT: 0, CENTER: 0, RIGHT: 0 } as Record<string, number>;
-    let personLeft = false,
-      personCenter = false,
-      personRight = false;
-    for (const d of detections) {
-      const [x1, y1, x2, y2] = d.box;
-      const cx = (x1 + x2) / 2;
-      const zone = zoneFromX(cx, width);
-      const isLowerImage = (y1 + y2) / 2 > height * 0.6; // closer to robot
-      const isPerson = d.cls === "person";
-      const weight = (isPerson ? 1.0 : 0.7) * (isLowerImage ? 1.2 : 1.0);
-      zones[zone] += weight;
-      if (isPerson) {
-        if (zone === "LEFT") personLeft = true;
-        if (zone === "CENTER") personCenter = true;
-        if (zone === "RIGHT") personRight = true;
-      }
-    }
-    const centerClear = zones.CENTER < 0.5;
-    const leftClear = zones.LEFT < 0.5;
-    const rightClear = zones.RIGHT < 0.5;
-
-    if (centerClear)
-      return {
-        action: "FORWARD",
-        confidence: 0.9,
-        reason: "FREE_PATH",
-        timestamp: Date.now(),
-      };
-    if (leftClear)
-      return {
-        action: "LEFT",
-        confidence: 0.8,
-        reason: personLeft ? "PERSON" : "OBSTACLE",
-        timestamp: Date.now(),
-      };
-    if (rightClear)
-      return {
-        action: "RIGHT",
-        confidence: 0.8,
-        reason: personRight ? "PERSON" : "OBSTACLE",
-        timestamp: Date.now(),
-      };
-    return {
-      action: "STOP",
-      confidence: 1.0,
-      reason: personCenter ? "PERSON" : "OBSTACLE",
-      timestamp: Date.now(),
-    };
-  }
-
-  // Simple orange cone detection via HSV threshold on the preprocessed canvas
-  function detectConeCentroid(): { x: number; y: number; area: number } | null {
-    const c = canvasRef.current;
-    if (!c) return null;
-    const ctx = c.getContext("2d")!;
-    const img = ctx.getImageData(0, 0, c.width, c.height);
-    const data = img.data;
-    let sumX = 0,
-      sumY = 0,
-      count = 0;
-    for (let i = 0; i < data.length; i += 4) {
-      const r = data[i] / 255,
-        g = data[i + 1] / 255,
-        b = data[i + 2] / 255;
-      // Convert to HSV (approx); threshold orange hue
-      const max = Math.max(r, g, b),
-        min = Math.min(r, g, b);
-      const d = max - min;
-      let h = 0;
-      if (d !== 0) {
-        if (max === r) h = ((g - b) / d) % 6;
-        else if (max === g) h = (b - r) / d + 2;
-        else h = (r - g) / d + 4;
-        h *= 60;
-        if (h < 0) h += 360;
-      }
-      const s = max === 0 ? 0 : d / max;
-      const v = max;
-      // Orange band: H in [15, 45], S>0.5, V>0.3 (tune as needed)
-      if (h >= 15 && h <= 45 && s > 0.5 && v > 0.3) {
-        const pix = i / 4;
-        const x = pix % c.width;
-        const y = Math.floor(pix / c.width);
-        sumX += x;
-        sumY += y;
-        count++;
-      }
-    }
-    if (count < 100) return null; // small blobs ignored
-    return { x: sumX / count, y: sumY / count, area: count };
-  }
-
-  type NavState =
-    | "IDLE"
-    | "SEARCH_TARGET"
-    | "ALIGN_TARGET"
-    | "MOVE_FORWARD"
-    | "AVOID_OBSTACLE"
-    | "ARRIVED"
-    | "EMERGENCY_STOP";
-  const [navState, setNavState] = useState<NavState>("IDLE");
-
-  async function tick() {
-    const video = videoRef.current;
-    if (!video || !session) return;
-    try {
-      const { tensor, ctx } = preprocess(video);
-      const feeds: Record<string, ort.Tensor> = {};
-      // Try common input names
-      feeds[session.inputNames[0]] = tensor;
-      const results = await session.run(feeds);
-      const outName = session.outputNames[0];
-      const output = results[outName] as ort.Tensor;
-      const arr = output.data as Float32Array | number[];
-
-      // Decode YOLOv8 output in common formats
-      const dims = output.dims;
-      const boxes: number[][] = [];
-      const scores: number[] = [];
-      const classes: number[] = [];
-
-      const pushBox = (
-        cx: number,
-        cy: number,
-        w: number,
-        h: number,
-        conf: number,
-        clsProb: number[],
-        clsStart = 0,
-      ) => {
-        if (conf < SCORE_THRESHOLD) return;
-        let best = -1,
-          bestVal = 0;
-        for (let i = 0; i < clsProb.length; i++) {
-          const v = clsProb[i];
-          if (v > bestVal) {
-            bestVal = v;
-            best = i;
-          }
-        }
-        const score = conf * bestVal;
-        if (score < SCORE_THRESHOLD) return;
-        const x1 = Math.max(0, cx - w / 2);
-        const y1 = Math.max(0, cy - h / 2);
-        const x2 = Math.min(INPUT_SIZE, cx + w / 2);
-        const y2 = Math.min(INPUT_SIZE, cy + h / 2);
-        boxes.push([x1, y1, x2, y2]);
-        scores.push(score);
-        classes.push(best + clsStart);
-      };
-
-      if (dims.length === 3) {
-        // Case A: [1, 84, N] -> rows are [x,y,w,h,80 classes]
-        const C = dims[1];
-        const N = dims[2];
-        if (C >= 84) {
-          for (let i = 0; i < N; i++) {
-            const x = (arr as any)[i];
-            const y = (arr as any)[N + i];
-            const w = (arr as any)[2 * N + i];
-            const h = (arr as any)[3 * N + i];
-            // No explicit obj conf in some exports; treat 1.0
-            const clsProb = [] as number[];
-            for (let c = 4; c < C; c++) clsProb.push((arr as any)[c * N + i]);
-            pushBox(x, y, w, h, 1.0, clsProb);
-          }
-        }
-      } else if (dims.length === 3 && dims[2] === 85) {
-        // Case B: [1, N, 85] -> xywh + conf + 80 classes per box
-        const N = dims[1];
-        for (let n = 0; n < N; n++) {
-          const base = n * 85;
-          const x = (arr as any)[base + 0];
-          const y = (arr as any)[base + 1];
-          const w = (arr as any)[base + 2];
-          const h = (arr as any)[base + 3];
-          const conf = (arr as any)[base + 4];
-          const clsProb = (arr as any).slice(base + 5, base + 85);
-          pushBox(x, y, w, h, conf, clsProb);
-        }
-      } else {
-        // Fallback: try stride 85 over flat data
-        const stride = 85;
-        for (let i = 0; i + stride <= arr.length; i += stride) {
-          const x = (arr as any)[i + 0];
-          const y = (arr as any)[i + 1];
-          const w = (arr as any)[i + 2];
-          const h = (arr as any)[i + 3];
-          const conf = (arr as any)[i + 4];
-          const clsProb = (arr as any).slice(i + 5, i + 85);
-          pushBox(x, y, w, h, conf, clsProb);
-        }
-      }
-      const keep = nms(boxes, scores, NMS_IOU_THRESHOLD);
-      const detections = keep.map((idx) => {
-        const clsIdx = classes[idx];
-        const clsName =
-          (classMap && classMap[clsIdx]) || CLASS_MAP[clsIdx] || `c${clsIdx}`;
-        return { box: boxes[idx], score: scores[idx], cls: clsName };
-      });
-
-      // Draw for debugging
-      const c = canvasRef.current!;
-      ctx.clearRect(0, 0, c.width, c.height);
-      ctx.strokeStyle = "#00ff88";
-      ctx.lineWidth = 2;
-      for (const d of detections) {
-        const [x1, y1, x2, y2] = d.box;
-        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-      }
-
-      // Cone detection
-      const cone = detectConeCentroid();
-      if (cone) {
-        ctx.fillStyle = "#ffaa00";
-        ctx.beginPath();
-        ctx.arc(cone.x, cone.y, 5, 0, Math.PI * 2);
-        ctx.fill();
-      }
-
-      // FSM
-      let cmd: Command = {
-        action: "STOP",
-        confidence: 1.0,
-        reason: "OBSTACLE",
-        timestamp: Date.now(),
-      };
-      const now = Date.now();
-      switch (navState) {
-        case "IDLE": {
-          // Wait for operator to start
-          cmd = {
-            action: "STOP",
-            confidence: 1.0,
-            reason: "FREE_PATH",
-            timestamp: now,
-          };
-          break;
-        }
-        case "SEARCH_TARGET": {
-          if (cone) {
-            setNavState("ALIGN_TARGET");
-            cmd = {
-              action: "STOP",
-              confidence: 0.9,
-              reason: "FREE_PATH",
-              timestamp: now,
-            };
-          } else {
-            cmd = {
-              action: "ROTATE_LEFT",
-              confidence: 0.9,
-              reason: "FREE_PATH",
-              timestamp: now,
-            };
-          }
-          break;
-        }
-        case "ALIGN_TARGET": {
-          if (!cone) {
-            setNavState("SEARCH_TARGET");
-            cmd = {
-              action: "ROTATE_LEFT",
-              confidence: 0.9,
-              reason: "FREE_PATH",
-              timestamp: now,
-            };
-          } else {
-            const offset = cone.x / INPUT_SIZE - 0.5; // negative left, positive right
-            if (Math.abs(offset) < 0.05) {
-              setNavState("MOVE_FORWARD");
-              cmd = {
-                action: "STOP",
-                confidence: 0.9,
-                reason: "FREE_PATH",
-                timestamp: now,
-              };
-            } else if (offset < 0) {
-              cmd = {
-                action: "ROTATE_LEFT",
-                confidence: 0.9,
-                reason: "FREE_PATH",
-                timestamp: now,
-              };
-            } else {
-              cmd = {
-                action: "ROTATE_RIGHT",
-                confidence: 0.9,
-                reason: "FREE_PATH",
-                timestamp: now,
-              };
-            }
-          }
-          break;
-        }
-        case "MOVE_FORWARD": {
-          // Obstacle avoidance via free-space check
-          const free = decideFreeSpace(detections, INPUT_SIZE, INPUT_SIZE);
-          if (free.action === "FORWARD") {
-            // Check if cone is near (area threshold)
-            if (cone && cone.area > INPUT_SIZE * INPUT_SIZE * 0.15) {
-              setNavState("ARRIVED");
-              cmd = {
-                action: "STOP",
-                confidence: 1.0,
-                reason: "FREE_PATH",
-                timestamp: now,
-              };
-            } else {
-              cmd = {
-                action: "FORWARD",
-                confidence: 0.9,
-                reason: free.reason,
-                timestamp: now,
-              };
-            }
-          } else if (free.action === "LEFT" || free.action === "RIGHT") {
-            setNavState("AVOID_OBSTACLE");
-            cmd = free;
-          } else {
-            cmd = free; // STOP
-          }
-          break;
-        }
-        case "AVOID_OBSTACLE": {
-          // Use free-space; when center clear, go back to align/forward depending on cone
-          const free = decideFreeSpace(detections, INPUT_SIZE, INPUT_SIZE);
-          if (free.action === "FORWARD") {
-            setNavState(cone ? "ALIGN_TARGET" : "SEARCH_TARGET");
-            cmd = {
-              action: "STOP",
-              confidence: 0.9,
-              reason: "FREE_PATH",
-              timestamp: now,
-            };
-          } else {
-            cmd = free;
-          }
-          break;
-        }
-        case "ARRIVED": {
-          cmd = {
-            action: "STOP",
-            confidence: 1.0,
-            reason: "FREE_PATH",
-            timestamp: now,
-          };
-          break;
-        }
-        case "EMERGENCY_STOP": {
-          cmd = {
-            action: "STOP",
-            confidence: 1.0,
-            reason: "OBSTACLE",
-            timestamp: now,
-          };
-          break;
-        }
-      }
-
-      setLastCommand(cmd);
-      sendCommand(cmd, espEndpoint);
-    } catch (e) {
-      issueStop("InferenceFailure");
-      setRunning(false);
-    }
-  }
-
-  useEffect(() => {
-    if (!running) return;
-    const id = setInterval(tick, COMMAND_FREQ_MS);
-    return () => clearInterval(id);
-  }, [running, session, espEndpoint, navState]);
+  const allDetections = [
+    ...(status?.person_detections || []),
+    ...(status?.nav_detections || []),
+  ];
 
   return (
-    <div className="p-4 space-y-3">
-      <h2 className="text-xl font-bold">Phone Perception</h2>
-      <div className="grid gap-2 grid-cols-2">
-        <Card className="p-2">
-          <video ref={videoRef} autoPlay playsInline muted className="w-full" />
-        </Card>
-        <Card className="p-2">
-          <canvas ref={canvasRef} className="w-full" />
-        </Card>
+    <div className="min-h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-white">
+      {/* ─── Header ─── */}
+      <div className="sticky top-0 z-30 px-4 py-3 border-b border-white/10 backdrop-blur-xl bg-slate-950/80">
+        <div className="flex items-center gap-3 max-w-6xl mx-auto">
+          <Link href="/">
+            <Button variant="ghost" size="icon" className="rounded-full h-9 w-9 text-white hover:bg-white/10">
+              <ArrowLeft className="w-5 h-5" />
+            </Button>
+          </Link>
+          <div className="flex-1">
+            <h1 className="text-lg font-bold flex items-center gap-2">
+              <Eye className="w-5 h-5 text-cyan-400" /> Detection Dashboard
+            </h1>
+            <p className="text-[10px] text-gray-400">Live YOLO detection feed • Read-only monitor</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-gray-500 font-mono">{fps} fps</span>
+            <Button
+              variant={polling ? "default" : "outline"}
+              size="sm"
+              className="h-8 text-xs"
+              onClick={() => setPolling((p) => !p)}
+            >
+              <RefreshCw className={`w-3 h-3 mr-1 ${polling ? "animate-spin" : ""}`} />
+              {polling ? "Live" : "Paused"}
+            </Button>
+          </div>
+        </div>
       </div>
-      <div className="flex gap-2 items-center">
-        <Button
-          onClick={() => {
-            setRunning((r) => !r);
-            if (!running) setNavState("SEARCH_TARGET");
-          }}
-        >
-          {running ? "Stop" : "Start"}
-        </Button>
-        <input
-          className="border px-2 py-1 rounded w-80"
-          value={espEndpoint}
-          onChange={(e) => setEspEndpoint(e.target.value)}
-          placeholder="http://ESP32-IP/cmd"
-        />
+
+      <div className="max-w-6xl mx-auto px-4 py-4 space-y-4">
+
+        {/* ─── System Health Bar ─── */}
+        <div className="flex items-center gap-3 flex-wrap">
+          {/* Connection */}
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/5 border border-white/10">
+            {healthy === null ? (
+              <Radio className="w-3 h-3 text-gray-400 animate-pulse" />
+            ) : healthy ? (
+              <CheckCircle className="w-3 h-3 text-green-400" />
+            ) : (
+              <XCircle className="w-3 h-3 text-red-400" />
+            )}
+            <span className="text-[11px] font-medium">
+              {healthy === null ? "Connecting…" : healthy ? "Connected" : "Disconnected"}
+            </span>
+          </div>
+          {/* Pipeline */}
+          {status && (
+            <>
+              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/5 border border-white/10">
+                <Activity className={`w-3 h-3 ${status.running ? "text-green-400" : "text-red-400"}`} />
+                <span className="text-[11px]">Pipeline {status.running ? "Running" : "Stopped"}</span>
+              </div>
+              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/5 border border-white/10">
+                <Cpu className="w-3 h-3 text-cyan-400" />
+                <span className="text-[11px]">Frame age: {status.frame_age_s}s</span>
+              </div>
+              {status.inference_failures > 0 && (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-red-500/10 border border-red-500/30">
+                  <AlertTriangle className="w-3 h-3 text-red-400" />
+                  <span className="text-[11px] text-red-400">Failures: {status.inference_failures}</span>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* ─── Main 2-Column Layout ─── */}
+        <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
+
+          {/* ─── LEFT: Camera Feed (3 cols) ─── */}
+          <div className="lg:col-span-3 space-y-4">
+            {/* Annotated Camera Frame */}
+            <Card className="bg-black/40 border-white/10 overflow-hidden">
+              <div className="p-3 border-b border-white/10 flex items-center gap-2">
+                <Camera className="w-4 h-4 text-cyan-400" />
+                <span className="text-sm font-semibold">Live Camera — YOLO Overlay</span>
+                <span className="ml-auto text-[10px] text-gray-500">
+                  Person YOLO (yolov8n) + Nav YOLO (best.pt)
+                </span>
+              </div>
+              <div className="relative aspect-video bg-black flex items-center justify-center">
+                {status?.annotated_frame ? (
+                  <img
+                    src={`data:image/jpeg;base64,${status.annotated_frame}`}
+                    alt="Annotated camera feed"
+                    className="w-full h-full object-contain"
+                  />
+                ) : (
+                  <div className="text-gray-600 text-sm flex flex-col items-center gap-2">
+                    <Camera className="w-10 h-10" />
+                    <span>{healthy === false ? "Vision server offline" : "Waiting for camera…"}</span>
+                  </div>
+                )}
+                {/* Intent overlay badge */}
+                {status && (
+                  <div className={`absolute top-3 right-3 px-3 py-1.5 rounded-lg border font-mono text-sm font-bold ${intentBg(status.intent)}`}>
+                    <span className={intentColor(status.intent)}>⚡ {status.intent}</span>
+                  </div>
+                )}
+              </div>
+            </Card>
+
+            {/* ─── Command Pipeline Flow ─── */}
+            <Card className="bg-black/40 border-white/10">
+              <button
+                className="w-full p-3 flex items-center gap-2 text-left"
+                onClick={() => setShowPipeline(!showPipeline)}
+              >
+                <Zap className="w-4 h-4 text-yellow-400" />
+                <span className="text-sm font-semibold flex-1">Command Pipeline — How It Works</span>
+                {showPipeline ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+              </button>
+              <AnimatePresence>
+                {showPipeline && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    className="overflow-hidden"
+                  >
+                    <div className="px-3 pb-4">
+                      {/* Architecture Flow */}
+                      <div className="flex items-center gap-2 flex-wrap text-xs mb-4">
+                        {[
+                          { icon: <Camera className="w-3 h-3" />, label: "Camera", sub: "OpenCV" },
+                          { icon: <Eye className="w-3 h-3" />, label: "Person YOLO", sub: "yolov8n.pt" },
+                          { icon: <Navigation className="w-3 h-3" />, label: "Nav YOLO", sub: "best.pt" },
+                          { icon: <Cpu className="w-3 h-3" />, label: "Fusion", sub: "Person > Nav" },
+                          { icon: <Wifi className="w-3 h-3" />, label: "ESP32", sub: "WiFi poll" },
+                        ].map((step, i) => (
+                          <div key={step.label} className="flex items-center gap-2">
+                            <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/5 border border-white/10">
+                              {step.icon}
+                              <div>
+                                <div className="font-semibold">{step.label}</div>
+                                <div className="text-[9px] text-gray-500">{step.sub}</div>
+                              </div>
+                            </div>
+                            {i < 4 && <ArrowRight className="w-3 h-3 text-gray-600" />}
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* Live data flow */}
+                      {status && (
+                        <div className="grid grid-cols-3 gap-2 text-xs">
+                          {/* Step 1: Person Detection */}
+                          <div className="rounded-lg p-2.5 bg-white/5 border border-white/10">
+                            <div className="flex items-center gap-1 mb-1.5">
+                              <User className="w-3 h-3 text-red-400" />
+                              <span className="font-semibold">Person Model</span>
+                            </div>
+                            <div className="space-y-0.5 text-[11px] text-gray-400">
+                              <p>Detected: <span className={status.person_detected ? "text-yellow-400 font-bold" : "text-green-400"}>{status.person_detected ? "YES" : "No"}</span></p>
+                              <p>Zone: <span className="text-white">{status.person_zone}</span></p>
+                              <p>Ratio: <span className="text-white">{(status.person_ratio * 100).toFixed(1)}%</span></p>
+                              <p>Conf: <span className="text-white">{(status.confidence * 100).toFixed(0)}%</span></p>
+                            </div>
+                          </div>
+                          {/* Step 2: Nav Detection */}
+                          <div className="rounded-lg p-2.5 bg-white/5 border border-white/10">
+                            <div className="flex items-center gap-1 mb-1.5">
+                              <Navigation className="w-3 h-3 text-cyan-400" />
+                              <span className="font-semibold">Nav Model</span>
+                            </div>
+                            <div className="space-y-0.5 text-[11px] text-gray-400">
+                              <p>State: <span className="text-white">{status.nav_state}</span></p>
+                              <p>Dest: <span className="text-white">{status.destination || "—"}</span></p>
+                              <p>Obstacles: <span className="text-red-400 font-bold">{status.nav_obstacles_count}</span></p>
+                              <p>Paths: <span className="text-green-400 font-bold">{status.nav_paths_count}</span></p>
+                              <p>Blocks: <span className="text-yellow-400">{status.nav_a_blocks_count + status.nav_b_blocks_count + status.nav_c_blocks_count}</span></p>
+                            </div>
+                          </div>
+                          {/* Step 3: Fusion Output */}
+                          <div className={`rounded-lg p-2.5 border ${intentBg(status.intent)}`}>
+                            <div className="flex items-center gap-1 mb-1.5">
+                              <Zap className="w-3 h-3 text-yellow-400" />
+                              <span className="font-semibold">→ ESP32 Command</span>
+                            </div>
+                            <div className="space-y-1">
+                              <p className={`text-2xl font-black ${intentColor(status.intent)}`}>
+                                {status.intent}
+                              </p>
+                              <p className="text-[10px] text-gray-500">
+                                {status.person_detected
+                                  ? "⚠️ Person override active"
+                                  : status.nav_state === "IDLE"
+                                    ? "💤 No mission"
+                                    : "🧭 Nav model driving"}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </Card>
+          </div>
+
+          {/* ─── RIGHT: Detection Details (2 cols) ─── */}
+          <div className="lg:col-span-2 space-y-4">
+
+            {/* Status Cards Grid */}
+            {status && (
+              <div className="grid grid-cols-2 gap-2">
+                <Card className="bg-black/40 border-white/10 p-3">
+                  <p className="text-[10px] text-gray-500 mb-0.5">Nav State</p>
+                  <div className="flex items-center gap-1.5">
+                    <span className={`w-2.5 h-2.5 rounded-full ${navStateColor(status.nav_state)}`} />
+                    <span className="font-bold text-sm">{status.nav_state}</span>
+                  </div>
+                </Card>
+                <Card className="bg-black/40 border-white/10 p-3">
+                  <p className="text-[10px] text-gray-500 mb-0.5">Mission</p>
+                  <span className="font-bold text-sm">{status.mode}</span>
+                  {status.destination && (
+                    <span className="ml-1 text-[10px] text-cyan-400">→ {status.destination}</span>
+                  )}
+                </Card>
+                <Card className={`p-3 border ${status.person_detected ? "bg-yellow-500/10 border-yellow-500/30" : "bg-black/40 border-white/10"}`}>
+                  <p className="text-[10px] text-gray-500 mb-0.5">Person</p>
+                  <span className={`font-bold text-sm ${status.person_detected ? "text-yellow-400" : "text-green-400"}`}>
+                    {status.person_detected ? `⚠ ${status.person_zone}` : "✓ Clear"}
+                  </span>
+                </Card>
+                <Card className={`p-3 border ${intentBg(status.intent)}`}>
+                  <p className="text-[10px] text-gray-500 mb-0.5">Command → ESP32</p>
+                  <span className={`font-bold text-sm ${intentColor(status.intent)}`}>{status.intent}</span>
+                </Card>
+              </div>
+            )}
+
+            {/* ─── All Detections List ─── */}
+            <Card className="bg-black/40 border-white/10">
+              <button
+                className="w-full p-3 flex items-center gap-2 text-left"
+                onClick={() => setShowDetections(!showDetections)}
+              >
+                <Shield className="w-4 h-4 text-green-400" />
+                <span className="text-sm font-semibold flex-1">
+                  All Detections ({allDetections.length})
+                </span>
+                {showDetections ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+              </button>
+              <AnimatePresence>
+                {showDetections && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    className="overflow-hidden"
+                  >
+                    <div className="px-3 pb-3 max-h-64 overflow-auto space-y-1.5">
+                      {allDetections.length === 0 ? (
+                        <p className="text-xs text-gray-600 py-2 text-center">No detections</p>
+                      ) : (
+                        allDetections.map((det, i) => (
+                          <div
+                            key={`det-${det.class}-${i}`}
+                            className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg border text-xs ${detClassColor(det.class)}`}
+                          >
+                            <span className="font-bold uppercase w-16 truncate">{det.class}</span>
+                            <span className="font-mono text-[10px] text-gray-400 flex-1">
+                              [{det.x1},{det.y1}]-[{det.x2},{det.y2}]
+                            </span>
+                            <span className="font-mono font-bold">
+                              {(det.confidence * 100).toFixed(0)}%
+                            </span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </Card>
+
+            {/* ─── Nav Detection Breakdown ─── */}
+            {status && (
+              <Card className="bg-black/40 border-white/10 p-3">
+                <p className="text-xs font-semibold mb-2 flex items-center gap-1.5">
+                  <Navigation className="w-3.5 h-3.5 text-cyan-400" />
+                  Nav Model Breakdown
+                </p>
+                <div className="grid grid-cols-5 gap-1 text-center">
+                  {[
+                    { label: "OBS", count: status.nav_obstacles_count, color: "text-red-400" },
+                    { label: "PATH", count: status.nav_paths_count, color: "text-green-400" },
+                    { label: "A", count: status.nav_a_blocks_count, color: "text-orange-400" },
+                    { label: "B", count: status.nav_b_blocks_count, color: "text-yellow-400" },
+                    { label: "C", count: status.nav_c_blocks_count, color: "text-blue-400" },
+                  ].map((b) => (
+                    <div key={b.label} className="rounded-lg bg-white/5 py-1.5">
+                      <p className={`text-xl font-black ${b.color}`}>{b.count}</p>
+                      <p className="text-[9px] text-gray-500">{b.label}</p>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            )}
+
+            {/* ─── Event Log ─── */}
+            <Card className="bg-black/40 border-white/10">
+              <div className="p-3 flex items-center justify-between border-b border-white/5">
+                <span className="text-xs font-semibold flex items-center gap-1.5">
+                  <Activity className="w-3.5 h-3.5 text-gray-400" />
+                  Event Log
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 text-[10px] text-gray-500 hover:text-white"
+                  onClick={() => setHistory([])}
+                >
+                  Clear
+                </Button>
+              </div>
+              <div className="max-h-40 overflow-auto p-2 font-mono text-[9px] space-y-px">
+                {history.length === 0 ? (
+                  <p className="text-gray-600 text-center py-2">Waiting for data…</p>
+                ) : (
+                  history.map((entry, i) => (
+                    <div key={`log-${i}`} className="text-gray-500 hover:text-gray-300 transition-colors">
+                      {entry}
+                    </div>
+                  ))
+                )}
+              </div>
+            </Card>
+          </div>
+        </div>
+
+        {/* ─── Footer ─── */}
+        <p className="text-[10px] text-center text-gray-600 py-2">
+          🔒 Read-only monitor — All movement decisions made by Python Vision Server → ESP32
+        </p>
       </div>
-      <pre className="text-xs bg-muted p-2 rounded overflow-auto">
-        {lastCommand ? JSON.stringify(lastCommand, null, 2) : "No command yet"}
-      </pre>
-      <p className="text-sm text-muted-foreground">
-        Safety: if camera/model/network fails, STOP is sent and loop halts.
-      </p>
     </div>
   );
 }
-
-// COCO class names (first 80)
-const CLASS_MAP = [
-  "person",
-  "bicycle",
-  "car",
-  "motorcycle",
-  "airplane",
-  "bus",
-  "train",
-  "truck",
-  "boat",
-  "traffic light",
-  "fire hydrant",
-  "stop sign",
-  "parking meter",
-  "bench",
-  "bird",
-  "cat",
-  "dog",
-  "horse",
-  "sheep",
-  "cow",
-  "elephant",
-  "bear",
-  "zebra",
-  "giraffe",
-  "backpack",
-  "umbrella",
-  "handbag",
-  "tie",
-  "suitcase",
-  "frisbee",
-  "skis",
-  "snowboard",
-  "sports ball",
-  "kite",
-  "baseball bat",
-  "baseball glove",
-  "skateboard",
-  "surfboard",
-  "tennis racket",
-  "bottle",
-  "wine glass",
-  "cup",
-  "fork",
-  "knife",
-  "spoon",
-  "bowl",
-  "banana",
-  "apple",
-  "sandwich",
-  "orange",
-  "broccoli",
-  "carrot",
-  "hot dog",
-  "pizza",
-  "donut",
-  "cake",
-  "chair",
-  "couch",
-  "potted plant",
-  "bed",
-  "dining table",
-  "toilet",
-  "tv",
-  "laptop",
-  "mouse",
-  "remote",
-  "keyboard",
-  "cell phone",
-  "microwave",
-  "oven",
-  "toaster",
-  "sink",
-  "refrigerator",
-  "book",
-  "clock",
-  "vase",
-  "scissors",
-  "teddy bear",
-  "hair drier",
-  "toothbrush",
-];

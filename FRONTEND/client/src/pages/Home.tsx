@@ -1,7 +1,7 @@
 import { RobotFace } from "@/components/RobotFace";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { GraduationCap, Package, Info } from "lucide-react";
+import { GraduationCap, Package, Info, Mic2 } from "lucide-react";
 import { Link } from "wouter";
 import { motion } from "framer-motion";
 
@@ -92,6 +92,28 @@ export default function Home() {
                 </span>
                 <span className="text-sm text-slate-500 font-medium opacity-80">
                   Deliveries & Tasks
+                </span>
+              </div>
+            </Button>
+          </Link>
+        </motion.div>
+
+        <motion.div variants={item}>
+          <Link href="/event-setup">
+            <Button
+              size="lg"
+              className="w-full h-24 text-xl rounded-[2rem] shadow-xl hover:shadow-2xl bg-white/80 backdrop-blur-md text-foreground border border-white/40 flex items-center justify-start px-8 gap-6 group hover-card-effect relative overflow-hidden"
+              data-testid="button-host"
+            >
+              <div className="p-4 bg-gradient-to-br from-amber-500 to-rose-500 rounded-2xl shadow-lg group-hover:scale-110 transition-transform duration-300 ring-2 ring-white/50">
+                <Mic2 className="w-8 h-8 text-white" />
+              </div>
+              <div className="text-left z-10">
+                <span className="block font-bold text-xl tracking-wide">
+                  Host Mode
+                </span>
+                <span className="text-sm text-slate-500 font-medium opacity-80">
+                  Event hosting & announcements
                 </span>
               </div>
             </Button>

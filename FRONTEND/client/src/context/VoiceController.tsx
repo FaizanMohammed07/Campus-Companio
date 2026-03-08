@@ -30,6 +30,8 @@ export type Intent =
   | "guide"
   | "help"
   | "stop"
+  | "describe"
+  | "host"
   | "unknown";
 
 // ============= CONTEXT TYPE =============
@@ -73,6 +75,9 @@ function extractLocation(transcript: string): string | null {
     "b block": "B_BLOCK",
     "block b": "B_BLOCK",
     "b-block": "B_BLOCK",
+    "c block": "C_BLOCK",
+    "block c": "C_BLOCK",
+    "c-block": "C_BLOCK",
     admin: "ADMIN",
     "admin block": "ADMIN",
     administration: "ADMIN",
@@ -90,6 +95,9 @@ function extractLocation(transcript: string): string | null {
     cafe: "CANTEEN",
     cafeteria: "CANTEEN",
     "food court": "CANTEEN",
+    exam: "EXAM",
+    "exam cell": "EXAM",
+    examination: "EXAM",
   };
 
   // Check exact matches first
@@ -140,6 +148,16 @@ function detectIntent(transcript: string): {
     return { intent: "stop", confidence: 0.95 };
   }
 
+  // Describe / Vision patterns
+  if (/\b(what.*see|describe|look\s*around|surroundings|in\s*front)\b/i.test(lower)) {
+    return { intent: "describe", confidence: 0.9 };
+  }
+
+  // Host mode patterns
+  if (/\b(host\s*mode|start\s*hosting|begin\s*hosting|event\s*mode|announce|announcements)\b/i.test(lower)) {
+    return { intent: "host", confidence: 0.9 };
+  }
+
   return { intent: "unknown", confidence: 0.0 };
 }
 
@@ -154,6 +172,11 @@ const DIRECTIONS_DB: Record<string, string[]> = {
     "Go to the main academic corridor.",
     "Follow the campus signboards for B Block.",
     "At the junction, take the route marked B Block and continue straight.",
+  ],
+  C_BLOCK: [
+    "Go to the main academic corridor.",
+    "Follow the campus signboards for C Block.",
+    "C Block is at the end of the corridor on the right.",
   ],
   ADMISSION: [
     "Go to the Admin Block front office area.",
@@ -174,6 +197,16 @@ const DIRECTIONS_DB: Record<string, string[]> = {
     "Go to the D Block area.",
     "Look for the Canteen entrance.",
     "The canteen is open from 8 AM to 8 PM.",
+  ],
+  EXAM: [
+    "Go to the Admin Block.",
+    "Look for the Exam Cell office.",
+    "Ask the staff for exam schedules and details.",
+  ],
+  ADMIN: [
+    "Go to the Admin Block front office area.",
+    "Look for the Admin office signage.",
+    "Ask the reception desk if you need further assistance.",
   ],
 };
 
@@ -313,6 +346,10 @@ export function VoiceControllerProvider({
           await handleGuideRequest();
         } else if (intent === "stop") {
           await handleStop();
+        } else if (intent === "describe") {
+          await handleDescribe(fullTranscript);
+        } else if (intent === "host") {
+          await handleHost();
         } else {
           // Unknown intent after greeting - just respond
           await speakAndResume(
@@ -350,6 +387,17 @@ export function VoiceControllerProvider({
         setConversationState("navigating");
         setIsListening(false);
         stopSpeechRecognition();
+
+        // Start the real robot mission via backend → vision server
+        try {
+          await fetch("/api/mission", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ destination: mentionedLocation }),
+          });
+        } catch (e) {
+          console.error("[Voice] Failed to start mission:", e);
+        }
 
         const label = mentionedLocation.replace(/_/g, " ");
         const dirs = DIRECTIONS_DB[mentionedLocation] || [];
@@ -425,6 +473,14 @@ export function VoiceControllerProvider({
         isProcessingRef.current = false;
       } else if (intent === "stop") {
         await handleStop();
+        setTranscript("");
+        isProcessingRef.current = false;
+      } else if (intent === "describe") {
+        await handleDescribe(transcript);
+        setTranscript("");
+        isProcessingRef.current = false;
+      } else if (intent === "host") {
+        await handleHost();
         setTranscript("");
         isProcessingRef.current = false;
       } else if (intent === "unknown") {
@@ -534,6 +590,17 @@ export function VoiceControllerProvider({
       setIsListening(false);
       if (isListening) stopSpeechRecognition();
 
+      // Start the real robot mission via backend → vision server
+      try {
+        await fetch("/api/mission", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ destination: activeDestination }),
+        });
+      } catch (e) {
+        console.error("[Voice] Failed to start mission:", e);
+      }
+
       await speakAndResume(
         "Please follow me. I will guide you safely to your destination.",
         false,
@@ -558,6 +625,13 @@ export function VoiceControllerProvider({
     setDestination(null);
     setDirections(null);
 
+    // Stop the real robot via backend → vision server
+    try {
+      await fetch("/api/stop", { method: "POST" });
+    } catch (e) {
+      console.error("[Voice] Failed to send stop:", e);
+    }
+
     await speakAndResume("Navigation cancelled. Returning to home.", true);
 
     setTimeout(() => {
@@ -565,6 +639,50 @@ export function VoiceControllerProvider({
       setConversationState("idle");
     }, 2000);
   }, [setLocation, speakAndResume]);
+
+  const handleDescribe = useCallback(
+    async (transcript: string) => {
+      setConversationState("processing");
+      setDisplayTranscript("Looking around...");
+
+      try {
+        const resp = await fetch("/api/voice-command", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            transcript,
+            uiContext: {
+              current_page: location,
+              available_actions: ["DESCRIBE"],
+            },
+          }),
+        });
+        const json = await resp.json();
+        const description =
+          json?.data?.response_text ||
+          "I'm having trouble seeing right now, please try again.";
+
+        await speakAndResume(description, true);
+      } catch (e) {
+        console.error("[Voice] Describe failed:", e);
+        await speakAndResume(
+          "I'm having trouble seeing right now, please try again.",
+          true,
+        );
+      }
+    },
+    [location, speakAndResume],
+  );
+
+  const handleHost = useCallback(async () => {
+    await speakAndResume(
+      "Opening host mode. You can set up your event and guest list there.",
+      false,
+    );
+    setTimeout(() => {
+      setLocation("/event-setup");
+    }, 1500);
+  }, [speakAndResume, setLocation]);
 
   const toggleMic = useCallback(
     (enabled: boolean) => {
@@ -608,11 +726,17 @@ export function VoiceControllerProvider({
         case "stop":
           await handleStop();
           break;
+        case "describe":
+          await handleDescribe(data?.transcript || "what do you see");
+          break;
+        case "host":
+          await handleHost();
+          break;
         default:
           break;
       }
     },
-    [handleGreeting, handleNavigation, handleGuideRequest, handleStop],
+    [handleGreeting, handleNavigation, handleGuideRequest, handleStop, handleDescribe, handleHost],
   );
 
   // ===== CONTEXT VALUE =====

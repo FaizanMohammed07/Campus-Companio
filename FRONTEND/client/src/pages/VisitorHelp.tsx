@@ -13,6 +13,9 @@ import { motion } from "framer-motion";
 import { useVoiceController } from "@/context/VoiceController";
 
 const LOCATIONS = [
+  { id: "A_BLOCK", name: "A Block", icon: "🏫" },
+  { id: "B_BLOCK", name: "B Block", icon: "🏫" },
+  { id: "C_BLOCK", name: "C Block", icon: "🏫" },
   { id: "FEE", name: "Fee Payment", icon: "💰" },
   { id: "ADMISSION", name: "Admissions", icon: "📝" },
   { id: "ADMIN", name: "Admin Office", icon: "🏢" },
@@ -22,6 +25,21 @@ const LOCATIONS = [
 ];
 
 const DIRECTIONS_DB: Record<string, string[]> = {
+  A_BLOCK: [
+    "Go to the main academic corridor.",
+    "Follow the campus signboards for A Block.",
+    "At the junction, take the route marked A Block.",
+  ],
+  B_BLOCK: [
+    "Go to the main academic corridor.",
+    "Follow the campus signboards for B Block.",
+    "At the junction, take the route marked B Block.",
+  ],
+  C_BLOCK: [
+    "Go to the main academic corridor.",
+    "Follow the campus signboards for C Block.",
+    "C Block is at the end of the corridor on the right.",
+  ],
   ADMIN: [
     "Go to the Admin Block front office area.",
     "Look for the Admin office signage.",
@@ -81,7 +99,7 @@ export default function VisitorHelp() {
       </div>
 
       {/* Location grid */}
-      <div className="grid grid-cols-2 gap-4 flex-1 content-start mb-6">
+      <div className="grid grid-cols-3 gap-3 flex-1 content-start mb-6">
         {LOCATIONS.map((loc) => (
           <motion.button
             key={loc.id}
@@ -134,11 +152,27 @@ export default function VisitorHelp() {
               size="lg"
               variant="secondary"
               className="flex-1 rounded-xl h-12"
-              onClick={() => {
+              onClick={async () => {
                 if (selectedLoc) {
                   const dirList = DIRECTIONS_DB[selectedLoc.id] || [];
                   setDestination(selectedLoc.id);
                   setDirections(dirList);
+
+                  // Start the real robot mission via backend → vision server
+                  try {
+                    const res = await fetch("/api/mission", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ destination: selectedLoc.id }),
+                    });
+                    if (!res.ok) {
+                      const err = await res.json().catch(() => ({}));
+                      console.error("[GuideMe] Mission start failed:", err);
+                    }
+                  } catch (e) {
+                    console.error("[GuideMe] Network error starting mission:", e);
+                  }
+
                   void dispatch("guide", { destination: selectedLoc.id });
                   setLocation(`/guidance/${selectedLoc.id}`);
                   setSelectedLoc(null);

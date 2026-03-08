@@ -10,6 +10,8 @@ import DirectionsPage from "@/pages/DirectionsPage";
 import GuidancePage from "@/pages/GuidancePage";
 import FacultyAccess from "@/pages/FacultyAccess";
 import Perception from "@/pages/Perception";
+import EventSetup from "@/pages/EventSetup";
+import HostMode from "@/pages/HostMode";
 import { StatusBar } from "@/components/StatusBar";
 import { EmergencyStop } from "@/components/EmergencyStop";
 import { useEffect } from "react";
@@ -26,6 +28,8 @@ function Router() {
       <Route path="/guidance/:id" component={GuidancePage} />
       <Route path="/faculty" component={FacultyAccess} />
       <Route path="/perception" component={Perception} />
+      <Route path="/event-setup" component={EventSetup} />
+      <Route path="/host-mode" component={HostMode} />
       <Route component={NotFound} />
     </Switch>
   );
