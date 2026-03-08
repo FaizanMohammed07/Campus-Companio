@@ -174,6 +174,34 @@ class VisionPipeline:
             self._mode = mode
         log.info("[MODE] Set to %s", mode)
 
+    # ── SCAN state helper ──
+
+    def _update_scan_state(self, perception) -> bool:
+        """Track consecutive blocked frames and decide if SCAN should fire.
+
+        Returns True if SCAN should be issued this frame. Only call this
+        when perception.frame_blocked is True AND a mission is active.
+        """
+        self._blocked_count += 1
+
+        scan_on_cooldown = (
+            time.time() - self._last_scan_ts < settings.scan_cooldown_s
+        )
+
+        if (
+            self._blocked_count >= settings.scan_trigger_frames
+            and not scan_on_cooldown
+        ):
+            self._blocked_count = 0
+            self._last_scan_ts = time.time()
+            log.info(
+                "[FUSION] SCAN triggered — %d persons, coverage=%.1f%%",
+                perception.person_count,
+                perception.total_person_coverage * 100,
+            )
+            return True
+        return False
+
     # ── Public API (called from Flask routes) ──
 
     def get_command(self) -> str:
@@ -411,70 +439,55 @@ class VisionPipeline:
                 log.warning("Nav model failed — using empty result")
                 nav_result = NavPerceptionResult()
 
-            # ══════════════════════════════════════════════════════════
-            #  PRIORITY 0: SCAN — Frame blocked by too many persons
-            #
-            #  When the whole frame is filled with people (multiple
-            #  persons covering >40% of frame), normal left/right
-            #  steering can't help.  After sustained blocking, issue
-            #  a SCAN command: ESP32 does a full 360° spin-in-place
-            #  while Python keeps analyzing frames to find a clear
-            #  path.  Once a clear frame appears, normal logic resumes.
-            # ══════════════════════════════════════════════════════════
-            if perception.frame_blocked:
-                self._blocked_count += 1
-            else:
+            # ── Reset blocked counter when frame is NOT blocked ──
+            if not perception.frame_blocked:
                 self._blocked_count = 0
 
-            scan_on_cooldown = (
-                time.time() - self._last_scan_ts < settings.scan_cooldown_s
-            )
+            # ══════════════════════════════════════════════════════════
+            #  GATE 0: HOST mode → robot is stationary, YOLO still
+            #  runs for perception data but motor forced to STOP.
+            # ══════════════════════════════════════════════════════════
+            if self._mode == "HOST":
+                intent = Intent.STOP
 
-            if (
-                self._blocked_count >= settings.scan_trigger_frames
-                and not scan_on_cooldown
-            ):
+            # ══════════════════════════════════════════════════════════
+            #  GATE 1: No active mission (IDLE) → STOP.
+            #  SCAN and navigation commands only apply when the user
+            #  has selected a destination.  Without a mission the
+            #  robot stays stationary — no CRUISE, no SCAN.
+            # ══════════════════════════════════════════════════════════
+            elif self._navigator.state == NavState.IDLE:
+                intent = Intent.STOP
+
+            # ══════════════════════════════════════════════════════════
+            #  From here on: a mission IS active.
+            # ══════════════════════════════════════════════════════════
+
+            # ── SCAN — Frame blocked by too many persons ──
+            #  Only triggered when a mission is active.  If the whole
+            #  frame is filled with people (>40% coverage) for several
+            #  consecutive frames, spin 360° to find a clear path.
+            elif perception.frame_blocked and self._update_scan_state(perception):
                 intent = Intent.SCAN
-                self._blocked_count = 0
-                self._last_scan_ts = time.time()
-                log.info(
-                    "[FUSION] SCAN triggered — %d persons, coverage=%.1f%%",
-                    perception.person_count,
-                    perception.total_person_coverage * 100,
-                )
 
             # ══════════════════════════════════════════════════════════
             #  FUSION: Distance-tiered person avoidance + navigation
             #
-            #  Gate:  If mode is HOST, YOLO still runs (perception
-            #         data updates) but motor is forced to STOP —
-            #         robot stays stationary while hosting an event.
-            #
-            #  Gate:  If navigator is IDLE (no active mission), YOLO
-            #         still runs (perception data updates) but the
-            #         motor command is forced to STOP.
-            #
-            #  FAR person  (ratio < 0.08)  → navigator drives (ignore person)
-            #  MED person  (0.08 – 0.25)   → person_intent steers away
-            #  NEAR person (ratio ≥ 0.25)  → STOP, unless CENTER where
+            #  No person / FAR person  → navigator drives (CRUISE or
+            #      nav steering).  The robot should NEVER sit still
+            #      when the path ahead is clear and a mission is on.
+            #  MED person  (0.08 – 0.25)  → person_intent steers away
+            #  NEAR person (ratio ≥ 0.25) → STOP, unless CENTER where
             #      nav obstacle data picks the best escape direction
-            #  No person                   → navigator drives
             # ══════════════════════════════════════════════════════════
-            elif self._mode == "HOST":
-                # HOST mode → robot is stationary, hosting event
-                intent = Intent.STOP
-
-            elif self._navigator.state == NavState.IDLE:
-                # No active mission → suppress all movement
-                intent = Intent.STOP
 
             elif not perception.person_detected:
-                # No person → navigator controls
+                # No person + mission active → navigator drives (CRUISE)
                 nav_cmd = self._navigator.update(nav_result)
                 try:
                     intent = Intent(nav_cmd)
                 except ValueError:
-                    intent = person_intent  # fallback
+                    intent = Intent.CRUISE  # fallback: keep moving
 
             elif perception.person_ratio < settings.person_far_ratio:
                 # FAR person → ignore, let navigator drive
