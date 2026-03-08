@@ -65,6 +65,9 @@ class VisionPipeline:
         self._blocked_count: int = 0       # consecutive frames with frame_blocked
         self._last_scan_ts: float = 0.0    # timestamp of last SCAN command
 
+        # ── Mode override (HOST mode forces STOP) ──
+        self._mode: str = "IDLE"  # IDLE | NAVIGATION | FOLLOW | HOST
+
         # ── Serial USB sender to ESP32 ──
         self._serial_port = None
         self._serial_thread: threading.Thread | None = None
@@ -148,12 +151,28 @@ class VisionPipeline:
 
     def set_destination(self, dest: str) -> None:
         self._navigator.set_destination(dest)
+        with self._lock:
+            self._mode = "NAVIGATION"
 
     def stop_mission(self) -> None:
         self._navigator.stop_mission()
+        with self._lock:
+            self._mode = "IDLE"
 
     def emergency_stop(self) -> None:
         self._navigator.emergency_stop()
+        with self._lock:
+            self._mode = "IDLE"
+
+    def set_mode(self, mode: str) -> None:
+        """Set pipeline mode: IDLE, NAVIGATION, FOLLOW, HOST."""
+        valid = ("IDLE", "NAVIGATION", "FOLLOW", "HOST")
+        mode = mode.upper().strip()
+        if mode not in valid:
+            raise ValueError(f"Invalid mode: {mode}. Must be one of {valid}")
+        with self._lock:
+            self._mode = mode
+        log.info("[MODE] Set to %s", mode)
 
     # ── Public API (called from Flask routes) ──
 
@@ -179,6 +198,8 @@ class VisionPipeline:
                 "running": self._running,
                 "frame_age_s": age,
                 "inference_failures": self._inference_failures,
+                "mode": self._mode,
+                "mission_active": nav_status["nav_state"] != "IDLE",
                 "person_detected": self._latest_perception.person_detected,
                 "person_ratio": round(self._latest_perception.person_ratio, 4),
                 "person_zone": self._latest_perception.person_zone,
@@ -247,6 +268,8 @@ class VisionPipeline:
                 "frame_age_s": age,
                 "inference_failures": self._inference_failures,
                 "intent": intent.value,
+                "mode": self._mode,
+                "mission_active": nav_status["nav_state"] != "IDLE",
                 "nav_state": nav_status["nav_state"],
                 "destination": nav_status["destination"],
                 # Person model
@@ -423,13 +446,28 @@ class VisionPipeline:
             # ══════════════════════════════════════════════════════════
             #  FUSION: Distance-tiered person avoidance + navigation
             #
+            #  Gate:  If mode is HOST, YOLO still runs (perception
+            #         data updates) but motor is forced to STOP —
+            #         robot stays stationary while hosting an event.
+            #
+            #  Gate:  If navigator is IDLE (no active mission), YOLO
+            #         still runs (perception data updates) but the
+            #         motor command is forced to STOP.
+            #
             #  FAR person  (ratio < 0.08)  → navigator drives (ignore person)
             #  MED person  (0.08 – 0.25)   → person_intent steers away
             #  NEAR person (ratio ≥ 0.25)  → STOP, unless CENTER where
             #      nav obstacle data picks the best escape direction
             #  No person                   → navigator drives
-            #  Navigator IDLE (no mission) → STOP
             # ══════════════════════════════════════════════════════════
+            elif self._mode == "HOST":
+                # HOST mode → robot is stationary, hosting event
+                intent = Intent.STOP
+
+            elif self._navigator.state == NavState.IDLE:
+                # No active mission → suppress all movement
+                intent = Intent.STOP
+
             elif not perception.person_detected:
                 # No person → navigator controls
                 nav_cmd = self._navigator.update(nav_result)
@@ -599,8 +637,12 @@ def create_app() -> Flask:
 
     @app.post("/robot-command")
     def robot_command():
-        """ESP32 polls this every 150ms to get movement commands."""
+        """ESP32 polls this every 150ms to get movement commands.
+        Response: {"command": "CRUISE"|"STOP"|"LEFT"|"RIGHT"|"BACK"|"SCAN"|...}
+        Designed for <50ms response time (pre-computed by pipeline thread).
+        """
         cmd = pipeline.get_command()
+        log.debug("[/robot-command] → %s", cmd)
         return jsonify({"command": cmd})
 
     @app.post("/set-destination")
@@ -630,6 +672,19 @@ def create_app() -> Flask:
         """Backend calls this for emergency stop or mission cancel."""
         pipeline.stop_mission()
         return jsonify({"ok": True, "nav_state": "IDLE"})
+
+    @app.post("/set-mode")
+    def set_mode():
+        """Backend calls this to switch pipeline mode (IDLE/NAVIGATION/FOLLOW/HOST)."""
+        data = request.get_json(silent=True) or {}
+        mode = data.get("mode", "").strip().upper()
+        if not mode:
+            return jsonify({"ok": False, "error": "missing mode"}), 400
+        try:
+            pipeline.set_mode(mode)
+            return jsonify({"ok": True, "mode": mode})
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
 
     @app.get("/status")
     def status():
@@ -662,5 +717,18 @@ def create_app() -> Flask:
             else "degraded"
         )
         return jsonify({"status": status_str, **data})
+
+    @app.get("/snapshot")
+    def snapshot():
+        """Return a raw base64 JPEG of the current camera frame (for LLM vision)."""
+        frame, age = pipeline._camera.get_frame()
+        if frame is None or age > settings.max_frame_age_s:
+            return jsonify({"ok": False, "error": "no frame available"}), 503
+        try:
+            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+            return jsonify({"ok": True, "image_b64": b64})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     return app

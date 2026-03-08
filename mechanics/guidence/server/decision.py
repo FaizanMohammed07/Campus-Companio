@@ -66,11 +66,9 @@ class DecisionEngine:
             self._clear_count = 0
             return self._state
 
-        # 2. No person → CRUISE (with debounce)
+        # 2. No person → CRUISE immediately
         if not person_detected:
-            self._clear_count += 1
-            if self._clear_count >= settings.debounce_cruise_frames:
-                self._state = Intent.CRUISE
+            self._state = Intent.CRUISE
             return self._state
 
         # Person detected — reset clear-frame counter

@@ -3,7 +3,6 @@ config.py — Immutable application settings.
 
 All tunables in one place.  Override via environment variables.
 """
-
 from dataclasses import dataclass
 import os
 import sys
