@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ArrowLeft, Plus, Trash2, Play, Users, Calendar, MapPin } from "lucide-react";
+import { ArrowLeft, Plus, Trash2, Play, Users, Calendar, MapPin, Download } from "lucide-react";
 import { Link, useLocation } from "wouter";
 import { motion, AnimatePresence } from "framer-motion";
 import { useToast } from "@/hooks/use-toast";
@@ -197,6 +197,31 @@ export default function EventSetup() {
     setLocation("/host-mode");
   };
 
+  // ── Export runsheet ──
+  const handleExportRunsheet = async () => {
+    try {
+      const res = await fetch("/api/host/runsheet/export");
+      const data = await res.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `guido-runsheet-${eventName || "event"}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast({ title: "Exported! 📋", description: "Runsheet downloaded." });
+    } catch (e) {
+      console.error("[EventSetup] Export error:", e);
+      toast({
+        title: "Export failed",
+        description: "Could not export runsheet.",
+        variant: "destructive",
+      });
+    }
+  };
+
   // ── Animation variants ──
   const container = {
     hidden: { opacity: 0 },
@@ -376,6 +401,16 @@ export default function EventSetup() {
                   </motion.div>
                 ))}
               </div>
+
+              {/* Export Runsheet Button (Improvement 9) */}
+              <Button
+                onClick={handleExportRunsheet}
+                variant="outline"
+                className="w-full rounded-xl h-10 text-sm"
+              >
+                <Download className="w-4 h-4 mr-2" />
+                Export Runsheet
+              </Button>
             </motion.div>
           )}
         </AnimatePresence>

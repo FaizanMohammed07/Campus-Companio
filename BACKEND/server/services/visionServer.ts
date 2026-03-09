@@ -118,3 +118,23 @@ export async function setVisionMode(
   logInfo("vision_set_mode", { mode });
   return visionFetch("/set-mode", "POST", { mode });
 }
+
+/**
+ * Send a direct motor command override to the Python vision server.
+ * Bypasses YOLO fusion — used for theatrical nudges (e.g. host mode).
+ * The override expires after `durationMs` milliseconds on the server.
+ * This function resolves after the local durationMs wait completes.
+ */
+export async function sendRobotCommand(
+  command: string,
+  durationMs: number,
+): Promise<VisionResult> {
+  logInfo("vision_robot_override", { command, durationMs });
+  const result = await visionFetch("/robot-command-override", "POST", {
+    command,
+    duration_s: durationMs / 1000,
+  });
+  // Wait for the override duration so the next call is sequential
+  await new Promise<void>((resolve) => setTimeout(resolve, durationMs));
+  return result;
+}

@@ -18,7 +18,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { asyncHandler, createError, sendOk } from "../utils/http";
 import { logInfo, logWarn } from "../utils/logger";
-import { setVisionMode } from "../services/visionServer";
+import { setVisionMode, sendRobotCommand } from "../services/visionServer";
 
 export const hostRouter = Router();
 
@@ -285,6 +285,28 @@ hostRouter.post(
     // Generate announcement script via LLM
     const script = await generateAnnouncementScript(guest, activeEvent);
 
+    // Generate Telugu translation (best-effort, don't fail if it doesn't work)
+    let scriptTelugu: string | null = null;
+    try {
+      scriptTelugu = await generateTeluguTranslation(script);
+    } catch (err) {
+      logWarn("host_telugu_failed", {
+        error: err instanceof Error ? err.message : "unknown",
+      });
+    }
+
+    // Physical nudge sequence — GUIDO moves theatrically during announcement
+    try {
+      await sendRobotCommand("CRUISE", 600);   // nudge forward
+      await sendRobotCommand("STOP", 400);      // pause
+      await sendRobotCommand("BACK", 600);      // back to position
+      await sendRobotCommand("STOP", 200);      // settle
+    } catch (err) {
+      logWarn("host_nudge_failed", {
+        error: err instanceof Error ? err.message : "unknown",
+      });
+    }
+
     // Mark guest as announced and store script
     guest.announced = true;
     guest.script = script;
@@ -296,6 +318,7 @@ hostRouter.post(
       {
         guest,
         script,
+        scriptTelugu,
         message: `Announcement generated for ${guest.name}`,
       },
       req.id,
@@ -357,6 +380,47 @@ hostRouter.post(
       { mode: "IDLE", message: "Host mode stopped" },
       req.id,
     );
+  }),
+);
+
+// ══════════════════════════════════════════════
+//  GET /api/host/runsheet/export — Download runsheet JSON
+// ══════════════════════════════════════════════
+hostRouter.get(
+  "/runsheet/export",
+  asyncHandler(async (req, res) => {
+    if (!activeEvent) {
+      throw createError(400, "NO_EVENT", "No active event to export.");
+    }
+
+    const exportData = {
+      eventName: activeEvent.name,
+      venue: activeEvent.venue,
+      eventDate: activeEvent.date,
+      description: activeEvent.description,
+      exportedAt: new Date().toISOString(),
+      totalGuests: activeEvent.guests.length,
+      guests: activeEvent.guests.map((g) => ({
+        id: g.id,
+        name: g.name,
+        title: g.title,
+        description: g.description,
+        order: g.order,
+        announced: g.announced,
+        script: g.script,
+      })),
+    };
+
+    const safeName = activeEvent.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const filename = `guido-runsheet-${safeName}-${dateStr}.json`;
+
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    logInfo("host_runsheet_export", { guests: activeEvent.guests.length });
+
+    return res.status(200).send(JSON.stringify(exportData, null, 2));
   }),
 );
 
@@ -461,4 +525,66 @@ Rules:
   // All models failed
   logWarn("host_announce_all_models_failed");
   return FALLBACK;
+}
+
+// ══════════════════════════════════════════════
+//  Telugu Translation Generator
+// ══════════════════════════════════════════════
+
+async function generateTeluguTranslation(
+  englishScript: string,
+): Promise<string | null> {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return null;
+
+  const prompt = `Translate this exact announcement into Telugu (Telugu script). Keep it natural and formal. Return only the Telugu translation, nothing else.
+
+English text: ${englishScript}`;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+
+    const resp = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": process.env.OPENROUTER_REFERER || "",
+          "X-Title": process.env.OPENROUTER_TITLE || "Campus Companion",
+        },
+        body: JSON.stringify({
+          model: "meta-llama/llama-3.1-8b-instruct:free",
+          messages: [{ role: "user", content: prompt }],
+        }),
+        signal: controller.signal,
+      },
+    );
+    clearTimeout(timeout);
+
+    if (!resp.ok) {
+      logWarn("host_telugu_llm_error", { status: resp.status });
+      return null;
+    }
+
+    const data = (await resp.json()) as Record<string, unknown>;
+    const choices = data?.choices as
+      | Array<{ message: { content: string } }>
+      | undefined;
+    const content: string = choices?.[0]?.message?.content ?? "";
+
+    if (content.trim()) {
+      logInfo("host_telugu_success");
+      return content.trim();
+    }
+
+    return null;
+  } catch (err) {
+    logWarn("host_telugu_exception", {
+      error: err instanceof Error ? err.message : "unknown",
+    });
+    return null;
+  }
 }

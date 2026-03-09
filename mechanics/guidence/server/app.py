@@ -68,6 +68,10 @@ class VisionPipeline:
         # ── Mode override (HOST mode forces STOP) ──
         self._mode: str = "IDLE"  # IDLE | NAVIGATION | FOLLOW | HOST
 
+        # ── Direct command override (for theatrical nudges) ──
+        self._override_cmd: str | None = None
+        self._override_expires: float = 0.0
+
         # ── Serial USB sender to ESP32 ──
         self._serial_port = None
         self._serial_thread: threading.Thread | None = None
@@ -204,9 +208,39 @@ class VisionPipeline:
 
     # ── Public API (called from Flask routes) ──
 
+    _VALID_OVERRIDE_CMDS = {"CRUISE", "STOP", "BACK", "LEFT", "RIGHT"}
+
+    def set_override(self, command: str, duration_s: float) -> None:
+        """Directly override motor command, bypassing YOLO fusion.
+
+        Used for theatrical nudges (e.g. GUIDO nudges forward during
+        an announcement). The override expires after *duration_s*.
+        """
+        command = command.upper().strip()
+        if command not in self._VALID_OVERRIDE_CMDS:
+            raise ValueError(
+                f"Invalid override command: {command}. "
+                f"Must be one of {self._VALID_OVERRIDE_CMDS}"
+            )
+        with self._lock:
+            self._override_cmd = command
+            self._override_expires = time.time() + duration_s
+        log.info("[OVERRIDE] %s for %.1fs", command, duration_s)
+
     def get_command(self) -> str:
         """Return movement command for ESP32."""
         with self._lock:
+            # Direct override takes absolute priority
+            if (
+                self._override_cmd is not None
+                and time.time() < self._override_expires
+            ):
+                return self._override_cmd
+
+            # Override expired — clear it
+            if self._override_cmd is not None:
+                self._override_cmd = None
+
             if not self._running:
                 return Intent.STOP.value
             if time.time() - self._last_update_ts > settings.max_frame_age_s:
@@ -657,6 +691,32 @@ def create_app() -> Flask:
         cmd = pipeline.get_command()
         log.debug("[/robot-command] → %s", cmd)
         return jsonify({"command": cmd})
+
+    @app.post("/robot-command-override")
+    def robot_command_override():
+        """Directly override motor command, bypassing YOLO fusion.
+
+        Used for theatrical nudges (e.g. GUIDO nudges forward during
+        host-mode announcements).  The override lasts for *duration_s*
+        then normal fusion resumes automatically.
+
+        Body: { "command": "CRUISE"|"STOP"|"BACK"|"LEFT"|"RIGHT",
+                "duration_s": 0.6 }
+        """
+        data = request.get_json(silent=True) or {}
+        command = data.get("command", "").strip().upper()
+        duration_s = float(data.get("duration_s", 0.5))
+
+        if not command:
+            return jsonify({"ok": False, "error": "missing command"}), 400
+        if duration_s <= 0 or duration_s > 5.0:
+            return jsonify({"ok": False, "error": "duration_s must be 0..5"}), 400
+
+        try:
+            pipeline.set_override(command, duration_s)
+            return jsonify({"ok": True, "command": command, "duration_s": duration_s})
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
 
     @app.post("/set-destination")
     def set_destination():
