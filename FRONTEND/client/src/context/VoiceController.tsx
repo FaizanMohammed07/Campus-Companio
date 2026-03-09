@@ -7,10 +7,11 @@ import React, {
   useCallback,
   useEffect,
 } from "react";
-import { useSpeechRecognition, speakAsync } from "@/hooks/use-speech";
+import { useSpeechRecognition } from "@/hooks/use-speech";
 import { useLocation } from "wouter";
 import { VoiceStatus } from "@/components/VoiceStatus";
 import { useToast } from "@/hooks/use-toast";
+import { speak as elevenLabsSpeak, stopSpeaking, checkTtsAvailability } from "@/lib/tts";
 
 // ============= STATE MACHINE TYPES =============
 export type ConversationState =
@@ -245,9 +246,13 @@ export function VoiceControllerProvider({
   const isProcessingRef = useRef(false);
   const greetingBufferRef = useRef<string>("");
 
-  // Request mic permission on mount
+  // TTS mode tracking
+  const [ttsMode, setTtsMode] = useState<"elevenlabs" | "fallback" | "unknown">("unknown");
+
+  // Request mic permission on mount + check TTS availability
   useEffect(() => {
     requestPermission();
+    checkTtsAvailability().then((mode) => setTtsMode(mode));
   }, [requestPermission]);
 
   // ===== AUTO RESET (60 seconds of inactivity) =====
@@ -259,6 +264,7 @@ export function VoiceControllerProvider({
     setDestination(null);
     setDirections(null);
     stopSpeechRecognition();
+    stopSpeaking();
     if (location !== "/") setLocation("/");
   }, [location, setLocation, stopSpeechRecognition]);
 
@@ -520,7 +526,7 @@ export function VoiceControllerProvider({
       setDisplayTranscript(text);
 
       try {
-        await speakAsync(text);
+        await elevenLabsSpeak(text);
         console.log("[Voice] Bot finished speaking");
       } catch (error) {
         console.error("[Voice] Speech synthesis error:", error);
@@ -787,6 +793,7 @@ export function VoiceControllerProvider({
             ? "Waiting for more... (3s)"
             : displayTranscript
         }
+        ttsMode={ttsMode}
       />
     </VoiceControllerContext.Provider>
   );

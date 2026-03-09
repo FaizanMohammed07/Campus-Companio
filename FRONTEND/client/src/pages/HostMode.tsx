@@ -17,6 +17,7 @@ import {
 import { useLocation } from "wouter";
 import { motion, AnimatePresence } from "framer-motion";
 import { useToast } from "@/hooks/use-toast";
+import { speak, stopSpeaking, checkTtsAvailability } from "@/lib/tts";
 
 // ── Types ──
 
@@ -40,55 +41,6 @@ interface EventData {
 
 type CrowdAction = "applause" | "seated" | "break" | "welcome" | "thankyou";
 type Language = "english" | "telugu";
-
-// ── TTS Helper ──
-
-function speakTTS(
-  text: string,
-  options?: { lang?: Language; onEnd?: () => void },
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (!window.speechSynthesis) {
-      reject(new Error("speechSynthesis not available"));
-      return;
-    }
-
-    window.speechSynthesis.cancel();
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 0.9;
-    utterance.pitch = 1.0;
-    utterance.volume = 1.0;
-
-    const voices = window.speechSynthesis.getVoices();
-
-    if (options?.lang === "telugu") {
-      const teluguVoice = voices.find(
-        (v) => v.lang === "te-IN" || v.lang.startsWith("te"),
-      );
-      if (teluguVoice) {
-        utterance.voice = teluguVoice;
-      }
-    } else {
-      const preferred = voices.find(
-        (v) =>
-          v.lang.startsWith("en") &&
-          (v.name.includes("Google") ||
-            v.name.includes("Samantha") ||
-            v.name.includes("Daniel")),
-      );
-      if (preferred) utterance.voice = preferred;
-    }
-
-    utterance.onend = () => {
-      options?.onEnd?.();
-      resolve();
-    };
-    utterance.onerror = (e) => reject(e);
-
-    window.speechSynthesis.speak(utterance);
-  });
-}
 
 // ── Applause Sound Generator (Web Audio API) ──
 
@@ -175,6 +127,9 @@ export default function HostMode() {
   const [showEmergencyInput, setShowEmergencyInput] = useState(false);
   const [emergencyText, setEmergencyText] = useState("");
 
+  // TTS mode tracking (ElevenLabs vs fallback)
+  const [ttsMode, setTtsMode] = useState<"elevenlabs" | "fallback" | "unknown">("unknown");
+
   // Voices loaded
   const voicesLoaded = useRef(false);
 
@@ -195,11 +150,17 @@ export default function HostMode() {
     };
   }, []);
 
-  // Cleanup intervals on unmount
+  // Check ElevenLabs availability on mount
+  useEffect(() => {
+    checkTtsAvailability().then((mode) => setTtsMode(mode));
+  }, []);
+
+  // Cleanup intervals + stop TTS on unmount
   useEffect(() => {
     return () => {
       if (countdownRef.current) clearInterval(countdownRef.current);
       if (timerRef.current) clearInterval(timerRef.current);
+      stopSpeaking();
     };
   }, []);
 
@@ -318,7 +279,7 @@ export default function HostMode() {
         setAnnouncing(true);
         setIsSpeaking(true);
         try {
-          await speakTTS(textToSpeak, {
+          await speak(textToSpeak, {
             lang: selectedLanguage === "telugu" && telugu ? "telugu" : "english",
           });
         } catch (e) {
@@ -365,7 +326,7 @@ export default function HostMode() {
       selectedLanguage === "telugu" && scriptTelugu ? scriptTelugu : currentScript;
     setIsSpeaking(true);
     try {
-      await speakTTS(textToSpeak, {
+      await speak(textToSpeak, {
         lang: selectedLanguage === "telugu" && scriptTelugu ? "telugu" : "english",
       });
     } catch (e) {
@@ -391,7 +352,7 @@ export default function HostMode() {
 
         setIsSpeaking(true);
         try {
-          await speakTTS(script);
+          await speak(script);
         } catch (e) {
           console.error("[HostMode] TTS error:", e);
         } finally {
@@ -404,23 +365,25 @@ export default function HostMode() {
   };
 
   // ── Emergency speak ──
-  const handleEmergencySpeak = () => {
+  const handleEmergencySpeak = async () => {
     if (!emergencyText.trim()) return;
     const text = emergencyText.trim();
     setShowEmergencyInput(false);
     setEmergencyText("");
 
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 1.1;
-    utterance.pitch = 1.1;
-    utterance.volume = 1.0;
-    window.speechSynthesis?.cancel();
-    window.speechSynthesis?.speak(utterance);
+    setIsSpeaking(true);
+    try {
+      await speak(text);
+    } catch (e) {
+      console.error("[HostMode] Emergency TTS error:", e);
+    } finally {
+      setIsSpeaking(false);
+    }
   };
 
   // ── Stop host mode ──
   const handleStopHostMode = async () => {
-    window.speechSynthesis?.cancel();
+    stopSpeaking();
     if (countdownRef.current) clearInterval(countdownRef.current);
     setSpeakerStartTime(null);
     try {
@@ -628,6 +591,50 @@ export default function HostMode() {
           />
         </div>
       </div>
+
+      {/* ── TTS Mode Badge ── */}
+      {ttsMode === "fallback" && (
+        <div className="mb-2 px-3 py-1.5 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-center gap-2">
+          <span className="text-xs text-amber-400">
+            ⚠️ Using device voice — ElevenLabs unavailable
+          </span>
+        </div>
+      )}
+
+      {/* ── Speaking Indicator + Stop ── */}
+      <AnimatePresence>
+        {isSpeaking && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            className="mb-2 px-4 py-2 bg-green-500/10 border border-green-500/30 rounded-xl flex items-center justify-between overflow-hidden"
+          >
+            <div className="flex items-center gap-2">
+              <motion.div
+                animate={{ scale: [1, 1.3, 1] }}
+                transition={{ duration: 1.2, repeat: Infinity }}
+                className="w-2 h-2 rounded-full bg-green-400"
+              />
+              <span className="text-sm text-green-300 font-medium">
+                🎙️ GUIDO is speaking…
+              </span>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10"
+              onClick={() => {
+                stopSpeaking();
+                setIsSpeaking(false);
+              }}
+            >
+              <Square className="w-3 h-3 mr-1" />
+              Stop
+            </Button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* ── Runsheet Sidebar ── */}
       <AnimatePresence>

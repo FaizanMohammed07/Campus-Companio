@@ -3,6 +3,7 @@ import { type Server } from "http";
 import { voiceRouter } from "./routes/voice";
 import { missionRouter } from "./routes/mission";
 import { hostRouter } from "./routes/host";
+import { ttsRouter } from "./routes/tts";
 import { asyncHandler, sendOk } from "./utils/http";
 import { getVisionHealth } from "./services/visionServer";
 
@@ -18,6 +19,9 @@ export async function registerRoutes(
 
   // Host mode (event hosting — LLM announcements + TTS)
   app.use("/api/host", hostRouter);
+
+  // ElevenLabs TTS proxy (keeps API key server-side)
+  app.use("/api/tts", ttsRouter);
 
   // Health endpoint
   app.get("/api/health", asyncHandler(async (req, res) => {

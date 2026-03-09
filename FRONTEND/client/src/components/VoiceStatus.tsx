@@ -5,9 +5,10 @@ type VoiceState = "idle" | "listening" | "processing" | "speaking";
 interface VoiceStatusProps {
   state?: VoiceState;
   text?: string;
+  ttsMode?: "elevenlabs" | "fallback" | "unknown";
 }
 
-export function VoiceStatus({ state = "idle", text }: VoiceStatusProps) {
+export function VoiceStatus({ state = "idle", text, ttsMode }: VoiceStatusProps) {
   if (state === "idle" && !text) return null;
 
   const colors = {
@@ -47,6 +48,11 @@ export function VoiceStatus({ state = "idle", text }: VoiceStatusProps) {
             <p className="text-lg font-medium text-foreground leading-tight">
                 {text || (state === "listening" ? "Listening..." : "Ready")}
             </p>
+            {ttsMode === "fallback" && state === "speaking" && (
+              <p className="text-xs text-amber-400 leading-tight mt-0.5">
+                ⚠️ Device voice — ElevenLabs unavailable
+              </p>
+            )}
         </div>
       </div>
     </motion.div>
