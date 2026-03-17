@@ -4,6 +4,7 @@ import { voiceRouter } from "./routes/voice";
 import { missionRouter } from "./routes/mission";
 import { hostRouter } from "./routes/host";
 import { ttsRouter } from "./routes/tts";
+import manualRouter from "./routes/manual";
 import { asyncHandler, sendOk } from "./utils/http";
 import { getVisionHealth } from "./services/visionServer";
 
@@ -22,6 +23,9 @@ export async function registerRoutes(
 
   // ElevenLabs TTS proxy (keeps API key server-side)
   app.use("/api/tts", ttsRouter);
+
+  // PS5 DualSense / Manual control (gamepad → Python vision server)
+  app.use("/api/manual", manualRouter);
 
   // Health endpoint
   app.get("/api/health", asyncHandler(async (req, res) => {

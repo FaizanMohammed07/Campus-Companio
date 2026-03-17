@@ -48,7 +48,7 @@ ttsRouter.post(
     const voiceId =
       bodyVoiceId ||
       process.env.ELEVENLABS_VOICE_ID ||
-      "9BWtsMINqrJLrRacOk9x"; // Aria
+      "pqHfZKP75CvOlQylNhV4"; // Bill — deep, warm male voice (free-tier compatible)
     const modelId = process.env.ELEVENLABS_MODEL || "eleven_turbo_v2_5";
 
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;

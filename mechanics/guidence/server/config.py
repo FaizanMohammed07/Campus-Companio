@@ -47,7 +47,7 @@ class Settings:
     #    Triggers a 360° SCAN to find a clear path
     frame_blocked_ratio: float = 0.40
     # Consecutive "blocked" frames before triggering SCAN (debounce)
-    scan_trigger_frames: int = 5
+    scan_trigger_frames: int = 2
     # Cooldown: min seconds between consecutive SCAN commands
     scan_cooldown_s: float = 8.0
 
@@ -58,8 +58,8 @@ class Settings:
     # ── Debounce: consecutive clear frames before CRUISE ──
     debounce_cruise_frames: int = 5
 
-    # ── Navigation model (best.pt) ──
-    nav_model_path: str = os.getenv("NAV_MODEL", "best.pt")
+    # ── Navigation model (yolov8n.pt — single model for everything) ──
+    nav_model_path: str = os.getenv("NAV_MODEL", "yolov8n.pt")
     nav_conf_threshold: float = float(os.getenv("NAV_CONF", "0.5"))
 
     # ── Block "reached" threshold (bbox area / frame area) ──

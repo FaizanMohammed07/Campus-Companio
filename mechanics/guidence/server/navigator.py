@@ -56,7 +56,7 @@ _DEST_TO_BUCKET = {
 
 
 class Navigator:
-    """Dynamic navigation FSM driven by best.pt detections."""
+    """Dynamic navigation FSM driven by yolov8n.pt detections."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()

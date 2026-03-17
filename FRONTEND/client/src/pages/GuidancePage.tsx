@@ -1,9 +1,11 @@
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, Navigation, AlertTriangle, User, Check, Loader2 } from "lucide-react";
+import { ArrowLeft, Navigation, AlertTriangle, User, Check, Loader2, Gamepad2 } from "lucide-react";
 import { Link } from "wouter";
 import { useVoiceController } from "@/context/VoiceController";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import GamepadController, { type ControlMode } from "@/components/GamepadController";
+import { speak } from "@/lib/tts";
 
 /* ─── Types matching GET /api/status response ─── */
 type RobotStatus = {
@@ -25,6 +27,13 @@ export default function GuidancePage({ params }: { params: { id: string } }) {
   const [connected, setConnected] = useState(false);
   const [completed, setCompleted] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── PS5 DualSense controller state ──
+  const [controlMode, setControlMode] = useState<ControlMode>("autonomous");
+  const [controllerConnected, setControllerConnected] = useState(false);
+  const [lastGamepadCmd, setLastGamepadCmd] = useState<string>("STOP");
+  const [modeOverlay, setModeOverlay] = useState<ControlMode | null>(null);
+  const modeOverlayTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const locationConfig: Record<string, { name: string; icon: string; color: string }> = {
     FEE: { name: "Fee Payment Counter", icon: "💰", color: "from-amber-500 to-orange-600" },
@@ -104,8 +113,53 @@ export default function GuidancePage({ params }: { params: { id: string } }) {
     return "text-cyan-400";
   };
 
+  /* ─── Gamepad mode change handler ─── */
+  const handleModeChange = useCallback((newMode: ControlMode) => {
+    setControlMode(newMode);
+
+    // Show overlay briefly
+    setModeOverlay(newMode);
+    if (modeOverlayTimer.current) clearTimeout(modeOverlayTimer.current);
+    modeOverlayTimer.current = setTimeout(() => setModeOverlay(null), 1500);
+
+    // Notify Python server
+    fetch("/api/manual/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: newMode }),
+    }).catch(() => {});
+
+    // Voice announcement
+    const labels: Record<ControlMode, string> = {
+      manual: "Manual mode. Gamepad has full control.",
+      assisted: "Assisted mode. Gamepad drives with safety override.",
+      autonomous: "Autonomous mode. GUIDO is self-driving.",
+    };
+    void speak(labels[newMode]);
+  }, []);
+
+  /* ─── Gamepad command sent callback ─── */
+  const handleCommandSent = useCallback((command: string) => {
+    setLastGamepadCmd(command);
+  }, []);
+
+  /* ─── Mode label + colors ─── */
+  const modeInfo: Record<ControlMode, { label: string; color: string; bg: string }> = {
+    autonomous: { label: "🤖 Autonomous", color: "text-cyan-300", bg: "bg-cyan-500/20 border-cyan-500/40" },
+    assisted:   { label: "🛡️ Assisted",   color: "text-amber-300", bg: "bg-amber-500/20 border-amber-500/40" },
+    manual:     { label: "🎮 Manual",     color: "text-purple-300", bg: "bg-purple-500/20 border-purple-500/40" },
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-900 via-slate-800 to-slate-900 text-white overflow-hidden relative">
+      {/* ── PS5 DualSense Gamepad Controller (invisible) ── */}
+      <GamepadController
+        mode={controlMode}
+        onModeChange={handleModeChange}
+        onControllerConnected={setControllerConnected}
+        onCommandSent={handleCommandSent}
+      />
+
       {/* Animated background elements */}
       <div className="fixed inset-0 -z-10 overflow-hidden">
         <div className={`absolute top-0 right-0 w-96 h-96 bg-gradient-to-r ${config.color} rounded-full mix-blend-screen blur-3xl opacity-20 animate-pulse`} />
@@ -135,6 +189,28 @@ export default function GuidancePage({ params }: { params: { id: string } }) {
           </div>
         </div>
       </motion.div>
+
+      {/* ── Controller Status Bar ── */}
+      {controllerConnected && (
+        <motion.div
+          initial={{ y: -20, opacity: 0 }}
+          animate={{ y: 0, opacity: 1 }}
+          className={`relative z-20 px-6 py-2 flex items-center justify-between border-b ${modeInfo[controlMode].bg}`}
+        >
+          <div className="flex items-center gap-2">
+            <Gamepad2 className="w-4 h-4 text-purple-300" />
+            <span className={`text-sm font-bold ${modeInfo[controlMode].color}`}>
+              {modeInfo[controlMode].label}
+            </span>
+          </div>
+          <div className="flex items-center gap-3 text-xs text-gray-400">
+            {controlMode !== "autonomous" && (
+              <span className="font-mono">{lastGamepadCmd}</span>
+            )}
+            <span className="text-green-400">● Connected</span>
+          </div>
+        </motion.div>
+      )}
 
       {/* Main Content */}
       <main className="relative z-10 px-6 pt-8 pb-32 max-w-2xl mx-auto">
@@ -278,6 +354,25 @@ export default function GuidancePage({ params }: { params: { id: string } }) {
           </div>
         </motion.div>
       </main>
+
+      {/* ── Mode Change Overlay (Step 6) ── */}
+      <AnimatePresence>
+        {modeOverlay && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.8 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.8 }}
+            transition={{ type: "spring", stiffness: 200, damping: 20 }}
+            className="fixed inset-0 z-40 flex items-center justify-center pointer-events-none"
+          >
+            <div className={`px-10 py-8 rounded-3xl backdrop-blur-xl border shadow-2xl ${modeInfo[modeOverlay].bg}`}>
+              <p className={`text-4xl font-black text-center ${modeInfo[modeOverlay].color}`}>
+                {modeInfo[modeOverlay].label}
+              </p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Arrival Celebration */}
       <AnimatePresence>

@@ -70,6 +70,7 @@ bool scanInProgress = false;
 
 // ======================== STATE ========================
 String currentCmd = "STOP";
+int    currentSpeed = 0;       // 0 = use default profile speeds
 
 // ======================== FORWARD DECLARATIONS ========================
 void  pollServer();
@@ -231,6 +232,19 @@ void parseCommand(String response) {
   String cmd = response.substring(valStart + 1, valEnd);
   cmd.trim();
 
+  // ── Parse optional speed suffix: "CRUISE:180" ──
+  int parsedSpeed = 0;   // 0 = use default profile speeds
+  int colonPos = cmd.indexOf(':');
+  if (colonPos > 0) {
+    String speedStr = cmd.substring(colonPos + 1);
+    cmd = cmd.substring(0, colonPos);
+    parsedSpeed = speedStr.toInt();
+    // Clamp to safe range (80–255)
+    if (parsedSpeed > 0) {
+      parsedSpeed = constrain(parsedSpeed, 80, 255);
+    }
+  }
+
   // Validate known commands
   if (cmd == "CRUISE"       || cmd == "STOP"         ||
       cmd == "PREFER_LEFT"  || cmd == "PREFER_RIGHT" ||
@@ -238,9 +252,10 @@ void parseCommand(String response) {
       cmd == "BACK"         || cmd == "SCAN") {
 
     if (cmd != currentCmd) {
-      Serial.printf("[CMD] %s → %s\n", currentCmd.c_str(), cmd.c_str());
+      Serial.printf("[CMD] %s → %s (speed=%d)\n", currentCmd.c_str(), cmd.c_str(), parsedSpeed);
     }
     currentCmd     = cmd;
+    currentSpeed   = parsedSpeed;
     lastValidCmdMs = millis();
   } else {
     Serial.printf("[CMD] Unknown command: %s\n", cmd.c_str());
@@ -254,13 +269,18 @@ void applyCommand(String cmd) {
   // No ultrasonic safety layers — vision server handles avoidance
   // L5 WATCHDOG handled in loop()
 
+  // When currentSpeed > 0 (gamepad mode), use it as override
+  int fwdSpeed  = (currentSpeed > 0) ? currentSpeed : SPEED_FULL;
+  int turnSpd   = (currentSpeed > 0) ? currentSpeed : TURN_SPEED;
+  int backSpeed = (currentSpeed > 0) ? currentSpeed : SPEED_REDUCED;
+
   // L6 EXECUTE COMMAND
-  if      (cmd == "CRUISE")       moveForward(SPEED_FULL);
-  else if (cmd == "LEFT")         turnLeft(TURN_SPEED);
-  else if (cmd == "RIGHT")        turnRight(TURN_SPEED);
+  if      (cmd == "CRUISE")       moveForward(fwdSpeed);
+  else if (cmd == "LEFT")         turnLeft(turnSpd);
+  else if (cmd == "RIGHT")        turnRight(turnSpd);
   else if (cmd == "PREFER_LEFT")  preferLeft();
   else if (cmd == "PREFER_RIGHT") preferRight();
-  else if (cmd == "BACK")         moveBackward(SPEED_REDUCED);
+  else if (cmd == "BACK")         moveBackward(backSpeed);
   else if (cmd == "SCAN")         executeScan();
   else                            emergencyStop();
 }

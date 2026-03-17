@@ -68,9 +68,11 @@ class VisionPipeline:
         # ── Mode override (HOST mode forces STOP) ──
         self._mode: str = "IDLE"  # IDLE | NAVIGATION | FOLLOW | HOST
 
-        # ── Direct command override (for theatrical nudges) ──
-        self._override_cmd: str | None = None
-        self._override_expires: float = 0.0
+        # ── PS5 DualSense controller fields ──
+        self._control_mode: str = "autonomous"  # autonomous | assisted | manual
+        self._manual_command: str = "STOP"
+        self._manual_speed: float = 0.0
+        self._manual_ts: float = 0.0
 
         # ── Serial USB sender to ESP32 ──
         self._serial_port = None
@@ -178,69 +180,11 @@ class VisionPipeline:
             self._mode = mode
         log.info("[MODE] Set to %s", mode)
 
-    # ── SCAN state helper ──
-
-    def _update_scan_state(self, perception) -> bool:
-        """Track consecutive blocked frames and decide if SCAN should fire.
-
-        Returns True if SCAN should be issued this frame. Only call this
-        when perception.frame_blocked is True AND a mission is active.
-        """
-        self._blocked_count += 1
-
-        scan_on_cooldown = (
-            time.time() - self._last_scan_ts < settings.scan_cooldown_s
-        )
-
-        if (
-            self._blocked_count >= settings.scan_trigger_frames
-            and not scan_on_cooldown
-        ):
-            self._blocked_count = 0
-            self._last_scan_ts = time.time()
-            log.info(
-                "[FUSION] SCAN triggered — %d persons, coverage=%.1f%%",
-                perception.person_count,
-                perception.total_person_coverage * 100,
-            )
-            return True
-        return False
-
     # ── Public API (called from Flask routes) ──
-
-    _VALID_OVERRIDE_CMDS = {"CRUISE", "STOP", "BACK", "LEFT", "RIGHT"}
-
-    def set_override(self, command: str, duration_s: float) -> None:
-        """Directly override motor command, bypassing YOLO fusion.
-
-        Used for theatrical nudges (e.g. GUIDO nudges forward during
-        an announcement). The override expires after *duration_s*.
-        """
-        command = command.upper().strip()
-        if command not in self._VALID_OVERRIDE_CMDS:
-            raise ValueError(
-                f"Invalid override command: {command}. "
-                f"Must be one of {self._VALID_OVERRIDE_CMDS}"
-            )
-        with self._lock:
-            self._override_cmd = command
-            self._override_expires = time.time() + duration_s
-        log.info("[OVERRIDE] %s for %.1fs", command, duration_s)
 
     def get_command(self) -> str:
         """Return movement command for ESP32."""
         with self._lock:
-            # Direct override takes absolute priority
-            if (
-                self._override_cmd is not None
-                and time.time() < self._override_expires
-            ):
-                return self._override_cmd
-
-            # Override expired — clear it
-            if self._override_cmd is not None:
-                self._override_cmd = None
-
             if not self._running:
                 return Intent.STOP.value
             if time.time() - self._last_update_ts > settings.max_frame_age_s:
@@ -261,6 +205,9 @@ class VisionPipeline:
                 "frame_age_s": age,
                 "inference_failures": self._inference_failures,
                 "mode": self._mode,
+                "control_mode": self._control_mode,
+                "manual_command": self._manual_command,
+                "manual_speed": self._manual_speed,
                 "mission_active": nav_status["nav_state"] != "IDLE",
                 "person_detected": self._latest_perception.person_detected,
                 "person_ratio": round(self._latest_perception.person_ratio, 4),
@@ -473,55 +420,68 @@ class VisionPipeline:
                 log.warning("Nav model failed — using empty result")
                 nav_result = NavPerceptionResult()
 
-            # ── Reset blocked counter when frame is NOT blocked ──
-            if not perception.frame_blocked:
+            # ══════════════════════════════════════════════════════════
+            #  PRIORITY 0: SCAN — Frame blocked by too many persons
+            #
+            #  When the whole frame is filled with people (multiple
+            #  persons covering >40% of frame), normal left/right
+            #  steering can't help.  After sustained blocking, issue
+            #  a SCAN command: ESP32 does a full 360° spin-in-place
+            #  while Python keeps analyzing frames to find a clear
+            #  path.  Once a clear frame appears, normal logic resumes.
+            # ══════════════════════════════════════════════════════════
+            if perception.frame_blocked:
+                self._blocked_count += 1
+            else:
                 self._blocked_count = 0
 
-            # ══════════════════════════════════════════════════════════
-            #  GATE 0: HOST mode → robot is stationary, YOLO still
-            #  runs for perception data but motor forced to STOP.
-            # ══════════════════════════════════════════════════════════
-            if self._mode == "HOST":
-                intent = Intent.STOP
+            scan_on_cooldown = (
+                time.time() - self._last_scan_ts < settings.scan_cooldown_s
+            )
 
-            # ══════════════════════════════════════════════════════════
-            #  GATE 1: No active mission (IDLE) → STOP.
-            #  SCAN and navigation commands only apply when the user
-            #  has selected a destination.  Without a mission the
-            #  robot stays stationary — no CRUISE, no SCAN.
-            # ══════════════════════════════════════════════════════════
-            elif self._navigator.state == NavState.IDLE:
-                intent = Intent.STOP
-
-            # ══════════════════════════════════════════════════════════
-            #  From here on: a mission IS active.
-            # ══════════════════════════════════════════════════════════
-
-            # ── SCAN — Frame blocked by too many persons ──
-            #  Only triggered when a mission is active.  If the whole
-            #  frame is filled with people (>40% coverage) for several
-            #  consecutive frames, spin 360° to find a clear path.
-            elif perception.frame_blocked and self._update_scan_state(perception):
+            if (
+                self._blocked_count >= settings.scan_trigger_frames
+                and not scan_on_cooldown
+            ):
                 intent = Intent.SCAN
+                self._blocked_count = 0
+                self._last_scan_ts = time.time()
+                log.info(
+                    "[FUSION] SCAN triggered — %d persons, coverage=%.1f%%",
+                    perception.person_count,
+                    perception.total_person_coverage * 100,
+                )
 
             # ══════════════════════════════════════════════════════════
             #  FUSION: Distance-tiered person avoidance + navigation
             #
-            #  No person / FAR person  → navigator drives (CRUISE or
-            #      nav steering).  The robot should NEVER sit still
-            #      when the path ahead is clear and a mission is on.
-            #  MED person  (0.08 – 0.25)  → person_intent steers away
-            #  NEAR person (ratio ≥ 0.25) → STOP, unless CENTER where
-            #      nav obstacle data picks the best escape direction
+            #  Gate:  HOST mode → STOP (robot stationary)
+            #  Gate:  IDLE nav  → STOP (no active mission)
+            #
+            #  No person               → navigator drives
+            #  FAR  (ratio < 0.08)     → ignore person, navigator drives
+            #  NEAR + CENTER (≥ 0.25)  → 360° SCAN (too close to guess)
+            #  MED  + CENTER           → gentle steer via nav data
+            #  NEAR + LEFT/RIGHT       → hard steer away (LEFT/RIGHT)
+            #  MED  + LEFT/RIGHT       → soft steer away (PREFER_*)
+            #
+            #  2+ persons blocking frame → SCAN after 2 consecutive
             # ══════════════════════════════════════════════════════════
+            elif self._mode == "HOST":
+                # HOST mode → robot is stationary, hosting event
+                intent = Intent.STOP
+
+            elif self._navigator.state == NavState.IDLE:
+                # No active mission → suppress all movement
+                intent = Intent.STOP
 
             elif not perception.person_detected:
-                # No person + mission active → navigator drives (CRUISE)
+                # No person → navigator controls
                 nav_cmd = self._navigator.update(nav_result)
                 try:
                     intent = Intent(nav_cmd)
                 except ValueError:
-                    intent = Intent.CRUISE  # fallback: keep moving
+                    intent = person_intent  # fallback
 
             elif perception.person_ratio < settings.person_far_ratio:
                 # FAR person → ignore, let navigator drive
@@ -531,17 +491,25 @@ class VisionPipeline:
                 except ValueError:
                     intent = Intent.CRUISE
 
+            elif perception.person_ratio >= settings.person_near_ratio and perception.person_zone == "CENTER":
+                # ── NEAR + CENTER → 360° SCAN ──
+                # Person filling the centre of the frame — too close
+                # to safely guess left/right.  Spin to find clear space.
+                intent = Intent.SCAN
+                self._last_scan_ts = time.time()
+                log.info(
+                    "[FUSION] NEAR+CENTER → SCAN (ratio=%.2f)",
+                    perception.person_ratio,
+                )
+
             elif person_intent == Intent.STOP and perception.person_zone == "CENTER":
-                # Person in CENTER at medium-to-near distance
-                # Use nav obstacle data to pick the BEST escape direction
-                # Count obstacle weight on each side
+                # ── MEDIUM + CENTER → gentle steer using nav data ──
                 left_obstacles = sum(
                     o.area_ratio for o in nav_result.obstacles if o.cx_norm < 0.5
                 )
                 right_obstacles = sum(
                     o.area_ratio for o in nav_result.obstacles if o.cx_norm >= 0.5
                 )
-                # Also factor in available path on each side
                 left_paths = sum(
                     p.area_ratio for p in nav_result.paths if p.cx_norm < 0.5
                 )
@@ -549,35 +517,32 @@ class VisionPipeline:
                     p.area_ratio for p in nav_result.paths if p.cx_norm >= 0.5
                 )
 
-                # Score: prefer the side with more path and fewer obstacles
                 left_score = left_paths - left_obstacles
                 right_score = right_paths - right_obstacles
 
-                if perception.person_ratio >= settings.person_near_ratio:
-                    # NEAR + CENTER → must escape NOW using nav data
-                    if left_score > right_score:
-                        intent = Intent.LEFT
-                    elif right_score > left_score:
-                        intent = Intent.RIGHT
-                    else:
-                        # Equal scores → default escape left
-                        intent = Intent.LEFT
-                    log.debug(
-                        "[FUSION] NEAR+CENTER escape: L_score=%.3f R_score=%.3f → %s",
-                        left_score, right_score, intent.value,
-                    )
+                if left_score > right_score:
+                    intent = Intent.PREFER_LEFT
+                elif right_score > left_score:
+                    intent = Intent.PREFER_RIGHT
                 else:
-                    # MEDIUM + CENTER → suggest direction but gentler
-                    if left_score > right_score:
-                        intent = Intent.PREFER_LEFT
-                    elif right_score > left_score:
-                        intent = Intent.PREFER_RIGHT
-                    else:
-                        intent = Intent.PREFER_LEFT
-                    log.debug(
-                        "[FUSION] MED+CENTER steer: L_score=%.3f R_score=%.3f → %s",
-                        left_score, right_score, intent.value,
-                    )
+                    intent = Intent.PREFER_LEFT
+                log.debug(
+                    "[FUSION] MED+CENTER steer: L=%.3f R=%.3f → %s",
+                    left_score, right_score, intent.value,
+                )
+
+            elif perception.person_ratio >= settings.person_near_ratio:
+                # ── NEAR + LEFT/RIGHT → hard steer away ──
+                if perception.person_zone == "LEFT":
+                    intent = Intent.RIGHT
+                elif perception.person_zone == "RIGHT":
+                    intent = Intent.LEFT
+                else:
+                    intent = Intent.STOP
+                log.debug(
+                    "[FUSION] NEAR+%s → %s",
+                    perception.person_zone, intent.value,
+                )
             else:
                 # Person detected at medium/near distance, not CENTER
                 # decision.py already computed PREFER_LEFT/RIGHT or STOP
@@ -686,37 +651,54 @@ def create_app() -> Flask:
     def robot_command():
         """ESP32 polls this every 150ms to get movement commands.
         Response: {"command": "CRUISE"|"STOP"|"LEFT"|"RIGHT"|"BACK"|"SCAN"|...}
+        In manual/assisted mode returns "CRUISE:180" format with PWM speed.
         Designed for <50ms response time (pre-computed by pipeline thread).
         """
+        # Manual/Assisted — bypass YOLO, use PS5 controller command
+        if pipeline._control_mode in ('manual', 'assisted'):
+            cmd = pipeline._manual_command
+            pwm = int(80 + pipeline._manual_speed * 175)
+            pwm = max(80, min(255, pwm))
+            print(f"[ROBOT-CMD] manual mode active, returning: {cmd}:{pwm}")
+            return jsonify({"command": f"{cmd}:{pwm}"})
+
+        # Autonomous — normal YOLO fusion command
         cmd = pipeline.get_command()
         log.debug("[/robot-command] → %s", cmd)
         return jsonify({"command": cmd})
 
-    @app.post("/robot-command-override")
-    def robot_command_override():
-        """Directly override motor command, bypassing YOLO fusion.
+    # ── PS5 DualSense manual control endpoints ──
 
-        Used for theatrical nudges (e.g. GUIDO nudges forward during
-        host-mode announcements).  The override lasts for *duration_s*
-        then normal fusion resumes automatically.
-
-        Body: { "command": "CRUISE"|"STOP"|"BACK"|"LEFT"|"RIGHT",
-                "duration_s": 0.6 }
-        """
+    @app.post("/manual-override")
+    def manual_override():
+        """Store gamepad command + speed for manual/assisted mode."""
         data = request.get_json(silent=True) or {}
-        command = data.get("command", "").strip().upper()
-        duration_s = float(data.get("duration_s", 0.5))
+        cmd = data.get("command", "STOP").strip().upper()
+        spd = float(data.get("speed", 0.0))
+        # Clamp speed to [0.0, 1.0]
+        spd = max(0.0, min(1.0, spd))
+        with pipeline._lock:
+            pipeline._manual_command = cmd
+            pipeline._manual_speed = spd
+            pipeline._manual_ts = time.time()
+        print(f"[MANUAL] override received: cmd={cmd} spd={spd}")
+        return jsonify({"ok": True})
 
-        if not command:
-            return jsonify({"ok": False, "error": "missing command"}), 400
-        if duration_s <= 0 or duration_s > 5.0:
-            return jsonify({"ok": False, "error": "duration_s must be 0..5"}), 400
-
-        try:
-            pipeline.set_override(command, duration_s)
-            return jsonify({"ok": True, "command": command, "duration_s": duration_s})
-        except ValueError as e:
-            return jsonify({"ok": False, "error": str(e)}), 400
+    @app.post("/set-control-mode")
+    def set_control_mode():
+        """Switch between autonomous / assisted / manual control."""
+        data = request.get_json(silent=True) or {}
+        mode = data.get("mode", "autonomous").strip().lower()
+        if mode not in ("autonomous", "assisted", "manual"):
+            return jsonify({"ok": False, "error": f"invalid mode: {mode}"}), 400
+        with pipeline._lock:
+            pipeline._control_mode = mode
+            # Reset manual command when switching to autonomous
+            if mode == "autonomous":
+                pipeline._manual_command = "STOP"
+                pipeline._manual_speed = 0.0
+        print(f"[MANUAL] control mode set to: {mode}")
+        return jsonify({"ok": True, "mode": mode})
 
     @app.post("/set-destination")
     def set_destination():

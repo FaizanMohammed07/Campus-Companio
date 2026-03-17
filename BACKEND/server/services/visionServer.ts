@@ -138,3 +138,32 @@ export async function sendRobotCommand(
   await new Promise<void>((resolve) => setTimeout(resolve, durationMs));
   return result;
 }
+
+// ── PS5 DualSense / Manual Control ──
+
+/**
+ * Send a manual motor command from the gamepad controller.
+ * The Python server's _manual_command / _manual_speed fields are updated,
+ * and the fusion loop will use them when control_mode ≠ autonomous.
+ */
+export async function sendManualCommand(
+  command: string,
+  speed: number,
+  mode: string,
+): Promise<VisionResult> {
+  logInfo("manual_command", { command, speed, mode });
+  return visionFetch("/manual-override", "POST", { command, speed, mode });
+}
+
+/**
+ * Switch the control mode on the Python vision server.
+ * "manual"    → gamepad has full authority, YOLO fusion bypassed.
+ * "assisted"  → gamepad drives, YOLO can veto into STOP for safety.
+ * "autonomous" → normal YOLO fusion (gamepad ignored).
+ */
+export async function setVisionControlMode(
+  mode: string,
+): Promise<VisionResult> {
+  logInfo("set_control_mode", { mode });
+  return visionFetch("/set-control-mode", "POST", { mode });
+}

@@ -1,5 +1,5 @@
 """
-nav_perception.py — Navigation YOLO model (best.pt)
+nav_perception.py — Navigation YOLO model (yolov8n.pt)
 Detects: OBSTACLE, PATH, A_BLOCK, B_BLOCK, C_BLOCK
 """
 
