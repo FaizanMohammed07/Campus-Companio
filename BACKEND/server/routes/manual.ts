@@ -25,7 +25,7 @@ const commandSchema = z.object({
     "PREFER_LEFT",
     "PREFER_RIGHT",
   ]),
-  speed: z.number().min(0).max(1),
+  speed: z.number().min(0).max(1).optional().default(0),
   mode: z.enum(["manual", "assisted", "autonomous"]),
 });
 
@@ -51,8 +51,8 @@ manualRouter.post("/command", async (req: Request, res: Response) => {
       return res.status(400).json({ ok: false, error: parsed.error.flatten() });
     }
 
-    const { command, speed, mode } = parsed.data;
-    console.log("[MANUAL] command received:", { command, speed, mode });
+  const { command, speed, mode } = parsed.data;
+  console.log(`[MANUAL] command=${command} mode=${mode}`);
 
     // Update local state
     lastCommand = command;
@@ -60,9 +60,8 @@ manualRouter.post("/command", async (req: Request, res: Response) => {
     controlMode = mode;
 
     // Forward to Python vision server
-    console.log("[MANUAL] forwarding to Python...");
-    const result = await sendManualCommand(command, speed, mode);
-    console.log("[MANUAL] Python response:", result);
+  const result = await sendManualCommand(command, speed, mode);
+  console.log("[MANUAL] Python response:", result);
 
     if (!result.ok) {
       return res.status(503).json({ ok: false, error: "Vision server unavailable" });

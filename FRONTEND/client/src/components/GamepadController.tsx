@@ -87,12 +87,12 @@ export default function GamepadController({
       if (sendingRef.current) return;
       sendingRef.current = true;
       try {
+        console.debug("[Gamepad] sending", { command, mode: modeRef.current });
         await fetch("/api/manual/command", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             command,
-            speed,
             mode: modeRef.current,
           }),
         });
@@ -178,7 +178,7 @@ export default function GamepadController({
     if (crossPressed) {
       command = "STOP"; // emergency stop
     } else if (trianglePressed) {
-      command = "SCAN";
+      command = currentMode === "manual" ? "STOP" : "SCAN";
     } else if (dpadUp) {
       command = "CRUISE";
     } else if (dpadDown) {
@@ -199,8 +199,7 @@ export default function GamepadController({
 
     // ── Send only when changed or heartbeat ──
     const now = Date.now();
-    const changed =
-      command !== lastCmdRef.current || Math.abs(speed - lastSpeedRef.current) > 0.05;
+    const changed = command !== lastCmdRef.current;
     const heartbeatDue = now - lastSendTsRef.current > HEARTBEAT_MS;
 
     // Don't spam identical STOP commands

@@ -27,7 +27,8 @@ class Settings:
     #    macOS: /dev/tty.usbserial-0001  or  /dev/cu.usbserial-0001
     #    Windows: COM9
     #    Linux: /dev/ttyUSB0
-    serial_port: str = os.getenv("SERIAL_PORT", "/dev/tty.usbserial-0001")
+    # Mac USB serial for ESP32 Dev Module
+    serial_port: str = os.getenv("SERIAL_PORT", "/dev/cu.usbserial-0001")
     serial_baud: int = int(os.getenv("SERIAL_BAUD", "115200"))
 
     # ── Pipeline health ──

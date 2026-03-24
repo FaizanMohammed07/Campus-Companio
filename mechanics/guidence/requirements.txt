@@ -1,6 +1,0 @@
-flask>=3.0
-ultralytics>=8.0
-opencv-python>=4.8
-torch>=2.0
-requests>=2.31
-pyserial>=3.5
